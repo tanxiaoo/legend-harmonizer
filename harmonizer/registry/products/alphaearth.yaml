@@ -1,0 +1,29 @@
+# Product registry entry — single source of truth for this source's metadata
+# (docs/PIPELINE.md, section 2.5). AlphaEarth is an embedding source, not a label
+# map, so it has no class legend.
+
+id: alphaearth
+display_name: AlphaEarth Satellite Embedding V1 (64-dim)
+provider: Google
+role: embedding          # reference | compare | embedding
+kind: embedding          # label | embedding
+
+access:
+  method: gee
+  asset_id: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
+
+# The embedding has 64 continuous bands (A00..A63); there is no single class band.
+band: null
+embedding_dims: 64
+resolution_m: 10.0
+available_years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+crs: EPSG:4326
+
+footprint: null          # global
+
+licence: CC-BY 4.0
+citation: >-
+  Google DeepMind / Google Earth Engine. AlphaEarth Satellite Embedding V1 Annual.
+
+# Embedding source: no class legend.
+legend: []

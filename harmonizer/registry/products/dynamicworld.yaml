@@ -1,0 +1,85 @@
+# Product registry entry — single source of truth for this map's metadata and
+# legend (docs/PIPELINE.md, section 2.5).
+
+id: dynamicworld
+display_name: Dynamic World V1 (annual modal, working year)
+provider: Google
+role: compare            # reference | compare | embedding
+kind: label             # label | embedding
+
+access:
+  method: gee
+  asset_id: GOOGLE/DYNAMICWORLD/V1
+  # Per-scene product; composited to an annual label by per-pixel modal class over
+  # the working year.
+  composite: annual_modal
+
+band: label             # discrete class band (0..8)
+resolution_m: 10.0
+available_years: [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+crs: EPSG:4326
+
+# Global product: no bounding footprint constrains the overlap.
+footprint: null
+
+licence: CC-BY 4.0
+citation: >-
+  Brown, C.F. et al. (2022). Dynamic World, Near real-time global 10 m land use
+  land cover mapping. Scientific Data 9, 251.
+
+# Descriptions are the Google Dynamic World V1 class definitions (abridged).
+legend:
+  - code: 0
+    name: Water
+    color: "#419bdf"
+    description: >-
+      Permanent and seasonal open water — rivers, ponds, lakes, oceans and
+      reservoirs.
+  - code: 1
+    name: Trees
+    color: "#397d49"
+    description: >-
+      Areas dominated by trees: dense green canopy, forests, tree plantations and
+      wooded vegetation, including partially wooded mosaics.
+  - code: 2
+    name: Grass
+    color: "#88b053"
+    description: >-
+      Open areas of grasses and herbaceous vegetation with little to no tree
+      cover — natural grasslands, lawns, parks and pastures.
+  - code: 3
+    name: Flooded vegetation
+    color: "#7a87c6"
+    description: >-
+      Vegetation growing in water that is seasonally or permanently flooded —
+      mangroves, marshes, swamps, rice paddies and other wetlands.
+  - code: 4
+    name: Crops
+    color: "#e49635"
+    description: >-
+      Human-planted/managed cereals, grasses and cultivated croplands, including
+      row crops and orchards.
+  - code: 5
+    name: Shrub and scrub
+    color: "#dfc35a"
+    description: >-
+      Mix of small woody plants, shrubs and sparse or dry vegetation, typically
+      shorter than trees — bushland, scrub and open savanna.
+  - code: 6
+    name: Built
+    color: "#c4281b"
+    description: >-
+      Human-made structures and impervious surfaces — buildings, roads, paved
+      areas and other dense urban/industrial development.
+  - code: 7
+    name: Bare
+    color: "#a59b8f"
+    description: >-
+      Areas of rock, sand or bare soil with little or no vegetation — deserts,
+      dry lake beds, exposed rock and beaches.
+  - code: 8
+    name: Snow and ice
+    color: "#b39fe1"
+    description: >-
+      Areas covered by snow or ice for most/all of the observation period —
+      glaciers, permanent snowfields and seasonal snow.

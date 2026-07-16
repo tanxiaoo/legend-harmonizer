@@ -1,0 +1,302 @@
+<!doctype html>
+<!-- Explorer-style workspace UI (Stage 5.4, re-laid-out over 5.3). The viewport is
+     split top-to-bottom: the top holds the two comparison maps side by side (parts 1
+     & 2), each with a floating map-picker + AOI-tool box over it and its per-class
+     legend (colour chips) directly beneath it; the bottom band holds the AOI
+     coordinate inputs + tools, the run parameters + Run, and an ECharts Sankey of the
+     mapping probabilities (with the CSV download links in its header). The on-screen
+     affinity heatmap and matching table are removed — they remain as CSV downloads.
+     Endpoints, run logic, and the matrix computation are unchanged; every element id
+     from 5.3 is preserved so app.js keeps working. Land-cover class colours stay as
+     legend data (swatches, tiles, Sankey nodes). Leaflet and ECharts load from CDNs;
+     no build step. See docs/PIPELINE.md, Stage 5.4. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Legend Harmonizer</title>
+    <link rel="stylesheet" href="style.css" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  </head>
+  <body data-mode="harmonize">
+    <!-- Mode switch (Stage 6c, docs/PIPELINE.md 6.7): Harmonize (the 5.4 run/read
+         workspace) vs Review (the investigate-and-decide inspector). Not a fourth
+         column and not a separate page — a switch within the same app, sharing live
+         state (matching table, fitted models, AOI). -->
+    <div id="mode-bar">
+      <span class="brand">Legend Harmonizer</span>
+      <div class="mode-tabs" role="tablist" aria-label="workspace mode">
+        <button id="mode-harmonize" class="mode-tab active" role="tab" aria-selected="true">Harmonize</button>
+        <button id="mode-review" class="mode-tab" role="tab" aria-selected="false">Review</button>
+      </div>
+      <span class="note" id="review-context"></span>
+    </div>
+
+    <main>
+      <!-- Parts 1 & 2: the two comparison maps side by side, each with a floating
+           picker/AOI box over it and its legend chips beneath. -->
+      <div id="maps-row">
+        <div class="map-col">
+          <div id="map-ref" class="map"></div>
+          <div class="map-controls" id="ref-map-title" title="Reference map">
+            <select id="reference" class="map-select" aria-label="reference map"></select>
+          </div>
+          <div class="legend" id="legend-ref"></div>
+        </div>
+        <div class="map-col">
+          <div id="map-cmp" class="map"></div>
+          <div class="map-controls" id="cmp-map-title" title="Compare map">
+            <select id="compare" class="map-select" aria-label="compare map"></select>
+          </div>
+          <div class="legend" id="legend-cmp"></div>
+        </div>
+      </div>
+
+      <!-- Drag to resize the maps row vs the bottom band. -->
+      <div class="resizer resizer-row" id="resize-rows" role="separator" aria-orientation="horizontal" tabindex="0"></div>
+
+      <!-- Class-coverage dialog (ⓘ next to "add AOI"): which AOI evidences each
+           class, and what is still absent on each map — the same server truth
+           the card list uses (/api/aoi/list), on demand. The only place absence
+           is reported: add another AOI for the absent classes, or continue. -->
+      <div id="coverage-modal" class="modal-backdrop" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="coverage-title">
+          <h2 id="coverage-title">Class coverage by AOI</h2>
+          <p class="note">
+            Each class is evidenced (GMM fitted) by the AOI listed with it. A new
+            AOI samples <strong>only the classes still absent from every AOI
+            before it</strong> — nothing already modelled is re-sampled.
+          </p>
+          <div id="coverage-lists"></div>
+          <div class="row modal-actions">
+            <button id="coverage-add-aoi" type="button">Add another AOI for the absent classes…</button>
+            <button id="coverage-continue" type="button" class="primary">Continue</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Bottom band: AOI + run controls | CSV viewer | Sankey. -->
+      <div id="control-band">
+        <section class="band-col" id="aoi-controls">
+          <div class="panel-head">
+            <h1>Legend Harmonizer</h1>
+            <span class="note" id="year-note"></span>
+          </div>
+          <p class="note">
+            Compare two land-cover legends via per-class GMMs and Bures–Wasserstein
+            affinity. Set the shared parameters, then add one or more AOIs —
+            draw a rectangle on a map, upload a boundary, or type a bounding box
+            on its card. Each card's <strong>Sample points</strong> button only
+            collects that AOI's points from GEE; <strong>Run all AOIs</strong>
+            fits the per-class GMMs and computes the affinity + crosswalk from
+            the cached points. The <strong>primary</strong> AOI carries the main
+            comparison; every other AOI is an auxiliary covering classes the
+            primary lacks.
+          </p>
+
+          <!-- Shared run parameters FIRST: ONE setting applies to every AOI
+               (primary and auxiliaries alike) — parameters are not per-AOI. -->
+          <div id="param-panel">
+            <div class="panel-head"><h2>Parameters — apply to all AOIs</h2></div>
+            <div class="row aoi">
+              <label>sample scale (m) <input id="sample_scale_m" type="number" step="any" /></label>
+              <label>GMM components (K) <input id="n_components" type="number" step="1" min="1" /></label>
+              <label>points floor <input id="points_floor" type="number" step="1" /></label>
+              <label>points target <input id="points_target" type="number" step="1" /></label>
+            </div>
+            <label class="inline">
+              <input id="force_refresh" type="checkbox" />
+              force refresh (re-sample from GEE, ignoring caches)
+            </label>
+          </div>
+
+          <!-- AOI cards (redesign of the Stage 7c manager): one card per AOI —
+               the primary plus each auxiliary. Every card carries its own bbox
+               inputs, boundary upload, overlap check, and its own Run/Sample
+               button. Sampled cards mirror server truth (cache/aois.json + the
+               GMM caches); draft cards live only in the page until sampled.
+               The ACTIVE card is the one map drawing/uploads write into. -->
+          <div id="aoi-list-panel">
+            <div class="panel-head">
+              <h2>AOIs</h2>
+              <span class="aoi-head-actions">
+                <button id="aoi-info" type="button" title="Class coverage: which AOI evidences each class, and what is still absent on each map">ⓘ</button>
+                <button id="aoi-add" type="button" title="Add an auxiliary AOI targeting the still-absent classes">＋ add AOI</button>
+              </span>
+            </div>
+            <div id="aoi-list"></div>
+          </div>
+
+          <!-- Run everything: the primary first (auxiliaries top up a primary
+               run, so it must exist), then each auxiliary card in order. Fits
+               the GMMs + computes the crosswalk from the cached points, sampling
+               anything not yet sampled. -->
+          <div class="row" id="run-all-row">
+            <button id="run" type="button" class="primary" title="Fit the per-class GMMs and compute the affinity + crosswalk from every AOI's cached points (samples anything not yet sampled)">Run all AOIs</button>
+            <span id="progress" class="progress"></span>
+          </div>
+
+          <div id="overlap-info" class="info"></div>
+          <p class="note" id="map-status"></p>
+          <p class="note" id="calibration-note"></p>
+        </section>
+
+        <div class="resizer resizer-col" data-col="1" role="separator" aria-orientation="vertical" tabindex="0"></div>
+
+        <section class="band-col" id="csv-panel">
+          <div class="panel-head">
+            <h2>Result tables</h2>
+            <label class="inline" id="csv-pick-wrap">
+              <select id="csv-pick" aria-label="which table">
+                <option value="matching_table">Matching table</option>
+                <option value="normalized_affinity">Normalized affinity</option>
+                <option value="raw_similarity">Raw similarity</option>
+              </select>
+              <a id="csv-download" class="download" href="#" download>⭳ CSV</a>
+            </label>
+          </div>
+          <div id="csv-view"><p class="note">Run a harmonization to view its result tables.</p></div>
+        </section>
+
+        <div class="resizer resizer-col" data-col="2" role="separator" aria-orientation="vertical" tabindex="0"></div>
+
+        <section class="band-col" id="sankey-panel">
+          <h2>Mapping Sankey</h2>
+          <p class="note">
+            Links flow from reference classes (left) to compare classes (right);
+            width = mapping probability. Run a harmonization to populate it.
+          </p>
+          <div id="sankey"></div>
+        </section>
+      </div>
+    </main>
+
+    <!-- Review mode (Stage 6c), re-laid-out as a twin of Harmonize (docs/PIPELINE.md
+         6.7). Two rows: the TOP row holds the two synced label-tile maps side by
+         side (reference | compare), each with its product picker, per-class legend
+         chips (clicking a chip solos that class AND focuses it as the reference/
+         compare class driving the review), and a class-description strip beneath
+         showing the clicked class's definition. The BOTTOM row holds the decision
+         (candidate edges + multi-select confirm + provenance + evidence patches) on
+         the left and a Sankey of the whole reviewed table on the right. Consumes
+         only the 6b endpoints — no new backend. -->
+    <div id="review-workspace" hidden>
+      <!-- Top row: two synced satellite maps. Each map's TITLE bar carries the
+           product name + a basemap picker + a year picker. Below the map sits a
+           single class dropdown (the class picker) and the selected class's
+           description. -->
+      <div id="rev-maps-row">
+        <div class="map-col">
+          <div id="rev-map-ref" class="map"></div>
+          <div class="map-controls rev-title-bar" id="rev-ref-title" title="Reference map">
+            <span id="rev-ref-label" class="rev-map-name"></span>
+            <span class="rev-title-sep">|</span>
+            <select id="rev-basemap-ref" class="map-select rev-title-select" aria-label="reference basemap"></select>
+            <span class="rev-title-sep" id="rev-year-sep-ref" hidden>|</span>
+            <select id="rev-year-ref" class="map-select rev-title-select" aria-label="reference basemap year" hidden></select>
+          </div>
+          <div class="rev-class-badge" id="rev-focus-ref" title="Class on this map (focused class, or the selected sample point's label)">no class</div>
+          <div class="rev-classbar">
+            <select id="rev-class-ref" class="rev-class-select" aria-label="reference class"></select>
+          </div>
+          <div class="rev-desc" id="rev-desc-ref">
+            <p class="note">Select a class to read its definition.</p>
+          </div>
+        </div>
+        <div class="map-col">
+          <div id="rev-map-cmp" class="map"></div>
+          <div class="map-controls rev-title-bar" id="rev-cmp-title" title="Compare map">
+            <span id="rev-cmp-label" class="rev-map-name"></span>
+            <span class="rev-title-sep">|</span>
+            <select id="rev-basemap-cmp" class="map-select rev-title-select" aria-label="compare basemap"></select>
+            <span class="rev-title-sep" id="rev-year-sep-cmp" hidden>|</span>
+            <select id="rev-year-cmp" class="map-select rev-title-select" aria-label="compare basemap year" hidden></select>
+          </div>
+          <div class="rev-class-badge" id="rev-focus-cmp" title="Class on this map (focused class, or the selected sample point's label)">no class</div>
+          <div class="rev-classbar">
+            <select id="rev-class-cmp" class="rev-class-select" aria-label="compare class"></select>
+          </div>
+          <div class="rev-desc" id="rev-desc-cmp">
+            <p class="note">Select a class to read its definition.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Drag to resize the maps row vs the bottom band. -->
+      <div class="resizer resizer-row" id="rev-resize-rows" role="separator" aria-orientation="horizontal" tabindex="0"></div>
+
+      <!-- Bottom band: three columns like Harmonize — evidence patches | decision |
+           Sankey. -->
+      <div id="rev-band">
+        <section class="band-col" id="rev-patches-panel">
+          <div class="panel-head"><h2>Evidence patches</h2></div>
+          <div class="row">
+            <button id="rev-explore" type="button" class="primary">Find evidence</button>
+            <label class="inline">points
+              <input id="rev-n" type="number" min="1" max="50" step="1" value="10" style="width:4em" />
+            </label>
+            <label class="inline" title="Live-query candidate oversample: draws this × points candidates so scarce combinations survive the declustering + pixel-exactness filters. Ignored when evidence comes from cached training points.">oversample ×
+              <input id="rev-oversample" type="number" min="1" max="10" step="0.5" value="2" style="width:4em" />
+            </label>
+            <span id="rev-explore-status" class="progress"></span>
+          </div>
+          <p class="note" id="rev-patch-note">
+            Representative locations for the focused class(es). Click a patch to fly
+            both maps to it and outline the queried pixel — or step through the
+            points with the ← / → arrow keys.
+          </p>
+          <div id="rev-patches"></div>
+        </section>
+
+        <div class="resizer resizer-col" data-revcol="1" role="separator" aria-orientation="vertical" tabindex="0"></div>
+
+        <section class="band-col" id="rev-decision">
+          <div class="panel-head"><h2>Decision</h2></div>
+          <p class="note" id="rev-decision-note">
+            Pick a reference class (and optionally a compare class) above to focus it.
+            Confirm which compare class(es) it corresponds to — the affinity ranking is
+            guidance only; you may confirm an edge ranked low or reach any class via
+            “more classes”.
+          </p>
+          <div id="rev-edges"><p class="note">Select a reference class to see its candidate edges.</p></div>
+          <div class="row" id="rev-confirm-row" hidden>
+            <button id="rev-confirm" type="button" class="primary">Confirm selected edges</button>
+            <button id="rev-retrain" type="button" title="Warm-start-refit the confirmed classes' GMMs and re-propose the open edges. Do this once after adjusting your classes — confirming alone never retrains.">Retrain model</button>
+          </div>
+          <span id="rev-confirm-status" class="progress"></span>
+          <div id="rev-retrain-report" class="note" hidden></div>
+        </section>
+
+        <div class="resizer resizer-col" data-revcol="2" role="separator" aria-orientation="vertical" tabindex="0"></div>
+
+        <section class="band-col" id="rev-sankey-panel">
+          <div class="panel-head">
+            <h2>Reviewed mapping</h2>
+            <label class="inline">
+              <button id="rev-view-toggle" type="button" title="Switch between the Sankey and the matching table">Table</button>
+              <a id="rev-table-csv" class="download" href="#" download>⭳ CSV</a>
+            </label>
+          </div>
+          <p class="note">
+            Links flow from reference classes (left) to compare classes (right);
+            width = mapping probability. Updates as you confirm edges.
+          </p>
+          <div id="rev-sankey"></div>
+          <div id="rev-table" hidden></div>
+        </section>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

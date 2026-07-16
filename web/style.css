@@ -1,0 +1,842 @@
+/* Explorer-style workspace UI styles (Stage 5.4 — re-layout over 5.3).
+   The viewport splits top-to-bottom: the top row holds the two comparison maps side
+   by side (each with a floating picker/AOI box and its legend chips beneath), and a
+   bottom control band holds the AOI inputs/tools, run parameters, and an ECharts
+   Sankey (with CSV downloads in its header). Dark theme, one accent colour. The
+   on-screen heatmap and matching table are gone (CSV only). IMPORTANT: land-cover
+   class colours are legend DATA and are applied inline from the API (swatches, tiles,
+   Sankey nodes) — they are never restyled here; only panel/text/chrome colours are
+   themed. See docs/PIPELINE.md, Stage 5.4. */
+
+:root {
+  /* Chrome — dark workspace. */
+  --bg: #0e1116;
+  --panel: #161b22;
+  --panel-2: #1c232c;
+  --raised: #212a34;
+  --ink: #e6edf3;
+  --muted: #8b98a5;
+  --line: #2a323d;
+  --line-soft: #222a33;
+
+  /* Single accent for buttons and active states. */
+  --accent: #4b93f7;
+  --accent-strong: #3b82f6;
+  --accent-dim: rgba(75, 147, 247, 0.16);
+
+  /* Status hues (badges + Sankey), tuned for the dark surface. */
+  --strong: #3fb27f;
+  --mixed: #d99b3a;
+  --orphan: #e2605a;
+  --absent: #7d8896;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+/* --- Mode bar + Harmonize/Review switching (Stage 6c) --------------------- */
+
+#mode-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+#mode-bar .brand { font-size: 14px; font-weight: 700; color: var(--ink); }
+.mode-tabs { display: inline-flex; gap: 2px; background: var(--panel-2); border-radius: 8px; padding: 2px; }
+.mode-tab {
+  font-size: 12px;
+  padding: 5px 14px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+}
+.mode-tab:hover { background: var(--raised); color: var(--ink); }
+.mode-tab.active { background: var(--accent); color: #0b1220; }
+#review-context { color: var(--accent); }
+
+/* The mode switch swaps which workspace is visible; state (models, AOI, table) is
+   shared — only the view changes. */
+body[data-mode="review"] main { display: none; }
+body[data-mode="review"] #review-workspace { display: grid; }
+body[data-mode="harmonize"] #review-workspace { display: none; }
+
+/* A matching-table row is the entry point to Review (docs/PIPELINE.md 6.7): a
+   mixed/orphan row is clickable. */
+tr.reviewable { cursor: pointer; }
+tr.reviewable:hover td { background: var(--accent-dim); }
+/* The entry-point arrow only in the Harmonize matching table; every Review-
+   table row is clickable, so the arrow would just be noise there. */
+#csv-view tr.reviewable td:first-child::after { content: " →"; color: var(--accent); }
+
+/* Post-retrain feedback: the "what changed" report under the buttons and the
+   per-candidate probability deltas in the decision rail. */
+#rev-retrain-report ul { margin: 4px 0 0; padding-left: 18px; }
+#rev-retrain-report li { margin: 2px 0; }
+.delta { font-size: 11px; margin-left: 6px; }
+.delta.up { color: #3fb950; }
+.delta.down { color: #f85149; }
+
+body {
+  margin: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden; /* no page scroll — regions scroll internally */
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  line-height: 1.45;
+}
+
+/* --- Two-row workspace: maps on top, control band below ------------------- */
+
+main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  /* Maps take a draggable height; the bottom band is 1fr so it always fills the
+     remaining space (no gap at the bottom when the maps are pulled up). */
+  grid-template-rows: var(--maps-height, 60%) 1px 1fr;
+  background: var(--line);
+}
+
+/* --- Top row: the two comparison maps side by side ----------------------- */
+
+#maps-row {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--line);
+}
+.map-col {
+  position: relative; /* anchor for the floating .map-controls */
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}
+.map {
+  flex: 1 1 auto;
+  min-height: 0;
+  background: #0b0e13;
+}
+
+/* Floating picker/title box over the top-left of each map (clear of Leaflet
+   zoom control, which sits at the same corner — shift it to the right). */
+.map-controls {
+  position: absolute;
+  top: 10px;
+  left: 54px;
+  z-index: 500;
+  background: rgba(22, 27, 34, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+  max-width: min(70%, 360px);
+}
+/* Esri-style map picker: just the map name + a dropdown arrow. */
+.map-select {
+  width: auto;
+  max-width: 340px;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+  padding: 8px 30px 8px 12px;
+  cursor: pointer;
+  text-overflow: ellipsis;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink) 50%),
+    linear-gradient(135deg, var(--ink) 50%, transparent 50%);
+  background-position: right 14px center, right 9px center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.map-select:focus { outline: none; box-shadow: none; }
+
+/* Legend chips beneath each map. A FIXED height (same on both sides) means a map
+   without a legend reserves identical space, so both maps stay exactly aligned. */
+.legend {
+  flex: 0 0 auto;
+  height: 74px;
+  padding: 8px 10px;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 6px 8px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+.legend .empty { color: var(--muted); font-size: 12px; }
+.legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink);
+  cursor: pointer;
+  user-select: none;
+  padding: 3px 8px 3px 5px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-2);
+}
+.legend-chip:hover { border-color: var(--accent); }
+/* Swatch fill is legend DATA (set inline from the API) — never themed here. */
+.legend-chip .swatch {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  flex: 0 0 auto;
+}
+.legend-chip.off { opacity: 0.4; filter: saturate(0.4); }
+
+/* --- Drag handles between regions ---------------------------------------- */
+
+/* A thin 1px seam (matching the map divider) with a wider invisible grab area so
+   it is still easy to drag. The accent highlight shows only on hover/drag. */
+.resizer {
+  position: relative;
+  background: var(--line);
+  z-index: 600;
+}
+.resizer::before {
+  content: "";
+  position: absolute;
+  z-index: 1;
+}
+.resizer-row { cursor: row-resize; }
+.resizer-row::before { left: 0; right: 0; top: -4px; bottom: -4px; }
+.resizer-col { cursor: col-resize; }
+.resizer-col::before { top: 0; bottom: 0; left: -4px; right: -4px; }
+.resizer:hover, .resizer:focus, .resizer.dragging {
+  background: var(--accent);
+  outline: none;
+}
+
+/* --- Bottom band: AOI | run | Sankey ------------------------------------- */
+
+#control-band {
+  min-height: 0;
+  display: grid;
+  grid-template-columns:
+    var(--band-col1, minmax(280px, 1fr)) 1px
+    var(--band-col2, minmax(280px, 1fr)) 1px
+    var(--band-col3, minmax(360px, 1.4fr));
+  background: var(--line);
+}
+.band-col {
+  background: var(--panel);
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px 18px;
+  display: flex;
+  flex-direction: column;
+}
+
+.band-col h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.panel-head h2 { margin: 0; }
+.band-col h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  color: var(--ink);
+}
+
+/* Scrollbars in the dark theme. */
+.band-col::-webkit-scrollbar, .legend::-webkit-scrollbar { width: 10px; height: 10px; }
+.band-col::-webkit-scrollbar-thumb, .legend::-webkit-scrollbar-thumb {
+  background: var(--line); border-radius: 6px;
+}
+.band-col::-webkit-scrollbar-thumb:hover { background: #384250; }
+
+/* --- Forms --------------------------------------------------------------- */
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-end;
+}
+.row.aoi label { flex: 1 1 calc(50% - 5px); }
+
+label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: var(--muted);
+  gap: 4px;
+}
+select, input {
+  font-size: 13px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--ink);
+  min-width: 0;
+  width: 100%;
+}
+select:focus, input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+input[type="file"] { padding: 5px; font-size: 12px; color: var(--muted); }
+
+.note { color: var(--muted); font-size: 12px; margin: 4px 0; }
+.note strong { color: var(--ink); font-weight: 600; }
+
+label.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--ink);
+}
+label.inline input { width: auto; min-width: 0; accent-color: var(--accent); }
+
+/* --- Buttons ------------------------------------------------------------- */
+
+button {
+  font-size: 13px;
+  padding: 8px 13px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--ink);
+  cursor: pointer;
+}
+button:hover { background: #29333e; }
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1220;
+  font-weight: 600;
+}
+button.primary:hover { background: var(--accent-strong); }
+button:disabled { opacity: 0.5; cursor: default; }
+
+.progress { font-size: 12px; color: var(--muted); align-self: center; }
+.progress.error, .info.error { color: var(--orphan); }
+
+.info {
+  margin-top: 10px;
+  font-size: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+}
+.info.warn { border-color: rgba(217, 155, 58, 0.4); color: var(--mixed); }
+
+#map-status { min-height: 16px; }
+
+/* --- Sankey panel -------------------------------------------------------- */
+
+#sankey { flex: 1 1 auto; min-height: 200px; width: 100%; }
+
+/* --- CSV / result-table viewer ------------------------------------------- */
+
+#csv-pick-wrap { gap: 8px; }
+#csv-pick { width: auto; min-width: 150px; }
+#csv-view { flex: 1 1 auto; min-height: 0; overflow: auto; margin-top: 8px; }
+
+.download {
+  display: inline-block;
+  padding: 6px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.download:hover { background: var(--accent-dim); }
+
+table.matching {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+table.matching th, table.matching td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  white-space: nowrap;
+}
+table.matching thead th {
+  color: var(--muted);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  z-index: 1;
+}
+table.matrix td { text-align: right; font-variant-numeric: tabular-nums; }
+table.matrix tbody th { color: var(--muted); font-weight: 600; }
+
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #0b1220;
+  text-transform: capitalize;
+}
+/* Modal chrome (the ⓘ coverage dialog) — the class swatches inside it are
+   legend data and keep their published colours. */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(6, 9, 13, 0.66);
+}
+.modal-backdrop[hidden] { display: none; }
+.modal {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  padding: 18px 20px 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+.modal h2 { margin: 0 0 6px; font-size: 15px; }
+.modal-actions { margin-top: 14px; justify-content: flex-end; }
+
+.badge.strong { background: var(--strong); }
+.badge.mixed { background: var(--mixed); }
+.badge.orphan { background: var(--orphan); color: #fff; }
+.badge.absent, .badge.unassigned { background: var(--absent); }
+tr.status-strong td { background: rgba(63, 178, 127, 0.09); }
+tr.status-mixed td { background: rgba(217, 155, 58, 0.09); }
+tr.status-orphan td { background: rgba(226, 96, 90, 0.10); }
+tr.status-absent td, tr.status-unassigned td { background: rgba(125, 136, 150, 0.08); }
+
+/* --- Leaflet chrome on dark ---------------------------------------------- */
+
+.leaflet-bar a, .leaflet-bar a:hover {
+  background: var(--raised);
+  color: var(--ink);
+  border-bottom-color: var(--line);
+}
+.leaflet-touch .leaflet-bar a { border-color: var(--line); }
+.leaflet-container { background: #0b0e13; }
+
+/* --- Review workspace (Stage 6c) ----------------------------------------- */
+/* Three columns: a fixed left rail (class-pair + patch index), the two large synced
+   inspector maps in the centre, and a fixed right rail (the decision). Fills the
+   viewport below the mode bar; each column scrolls internally. */
+
+/* Review is a twin of Harmonize: a two-row grid (maps row + bottom band), the
+   maps row draggable via --maps-height just like #main. */
+#review-workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+  grid-template-rows: var(--maps-height, 60%) 1px 1fr;
+  background: var(--line);
+}
+
+/* Top row: two label-tile maps side by side, reusing .map-col / .legend from
+   Harmonize so it matches visually. */
+#rev-maps-row {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--line);
+}
+/* Map title bar: product name | basemap picker | year picker, inline. Widened
+   from the plain .map-controls to hold the three items. */
+.rev-title-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(88%, 560px);
+  padding: 2px 6px;
+}
+/* Floating class badge at the top-RIGHT corner of each Review map: the focused
+   class, or the selected sample point's label on that map. */
+.rev-class-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(22, 27, 34, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--ink);
+  white-space: nowrap;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rev-class-badge .swatch {
+  width: 11px; height: 11px; border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.25); flex: 0 0 auto;
+}
+.rev-map-name { font-size: 13px; font-weight: 600; color: var(--ink); padding-left: 6px; white-space: nowrap; }
+.rev-title-sep { color: var(--muted); font-size: 12px; }
+.rev-title-select {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 24px 4px 8px;
+  max-width: 190px;
+}
+
+/* Class picker bar beneath each map: a single dropdown selecting the focused
+   reference/compare class. */
+.rev-classbar {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+.rev-class-select {
+  width: 100%;
+  font-size: 13px;
+  padding: 6px 28px 6px 10px;
+}
+
+/* Class-description strip beneath the picker: the selected class + its definition.
+   Fixed height so both columns match; scrolls internally for long text. */
+.rev-desc {
+  flex: 0 0 auto;
+  height: 84px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.rev-desc .rev-desc-head { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.rev-desc .rev-desc-head .swatch {
+  width: 12px; height: 12px; border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.25); flex: 0 0 auto;
+}
+.rev-desc .rev-desc-name { font-weight: 600; color: var(--ink); }
+.rev-desc .rev-desc-text { color: var(--muted); }
+
+/* Bottom band: three columns — patches | decision | Sankey (like Harmonize). */
+#rev-band {
+  min-height: 0;
+  display: grid;
+  grid-template-columns:
+    var(--rev-band-col1, minmax(240px, 1fr)) 1px
+    var(--rev-band-col2, minmax(280px, 1fr)) 1px
+    minmax(320px, 1.3fr);
+  background: var(--line);
+}
+#rev-sankey { flex: 1 1 auto; min-height: 220px; }
+#rev-table { flex: 1 1 auto; min-height: 0; overflow: auto; }
+
+/* Patch thumbnail index (patches panel). Each patch is a location card. */
+#rev-patches { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.patch-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  cursor: pointer;
+  font-size: 12px;
+}
+.patch-card:hover { border-color: var(--accent); }
+.patch-card.active { border-color: var(--accent); background: var(--accent-dim); }
+.patch-card .coord { color: var(--muted); font-variant-numeric: tabular-nums; }
+.patch-card .labels { display: flex; gap: 6px; flex-wrap: wrap; }
+.patch-card .lab { display: inline-flex; align-items: center; gap: 4px; }
+.patch-card .lab .swatch {
+  width: 11px; height: 11px; border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.25); flex: 0 0 auto;
+}
+
+/* Candidate edges (right rail). Each is a selectable row carrying provenance. */
+#rev-edges { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.edge-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.edge-row input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+.edge-row .edge-name { flex: 1 1 auto; color: var(--ink); }
+.edge-row .edge-prob { color: var(--muted); font-variant-numeric: tabular-nums; }
+.edge-row.confirmed { border-color: var(--strong); background: rgba(63, 178, 127, 0.10); }
+.prov {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.prov.confirmed { background: var(--strong); color: #0b1220; }
+.prov.open { background: var(--raised); color: var(--muted); }
+
+/* Fix 2: folded "+ more classes" disclosure in the decision panel. */
+details.more-classes { margin-top: 4px; }
+details.more-classes > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--accent);
+  padding: 6px 4px;
+  user-select: none;
+}
+details.more-classes > summary:hover { color: var(--ink); }
+.more-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  margin: 3px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink);
+}
+.more-option:hover { border-color: var(--accent); }
+.more-option .swatch {
+  width: 11px; height: 11px; border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.25); flex: 0 0 auto;
+}
+.more-option .edge-prob {
+  margin-left: auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The focused reference/compare class chip in Review is outlined. */
+.legend-chip.focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* --- Narrow viewport fallback: allow the workspace to stack + scroll ------ */
+@media (max-width: 900px) {
+  body { overflow: auto; height: auto; }
+  main { grid-template-rows: none; }
+  #maps-row { grid-template-columns: 1fr; }
+  .map-col { min-height: 360px; }
+  #control-band { grid-template-columns: 1fr; }
+  .band-col { overflow-y: visible; }
+  #review-workspace { grid-template-rows: none; }
+  #rev-maps-row { grid-template-columns: 1fr; }
+  #rev-band { grid-template-columns: 1fr; }
+}
+
+/* --- AOI manager (Stage 7c) ------------------------------------------------
+   One entry per AOI of the run (primary + auxiliaries), each listing the
+   classes it evidences. Chrome only — class swatch colours are legend DATA and
+   arrive inline from the API. */
+#aoi-list-panel { margin-top: 12px; }
+#aoi-list-panel .panel-head { display: flex; align-items: center; justify-content: space-between; }
+#aoi-list-panel .panel-head h2 { font-size: 12px; margin: 0; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+#aoi-add { font-size: 12px; }
+
+.aoi-entry {
+  margin-top: 6px;
+  padding: 7px 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+}
+.aoi-entry.aoi-primary { border-color: var(--line); background: var(--raised); }
+.aoi-entry-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.aoi-entry-name { font-size: 12px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+.aoi-entry-actions { display: inline-flex; gap: 4px; flex: 0 0 auto; }
+button.mini {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+button.mini:hover { color: var(--ink); background: var(--raised); }
+/* Armed two-step delete: first click arms, second deletes. */
+button.mini.danger {
+  color: #fff;
+  background: var(--orphan);
+  border-color: var(--orphan);
+}
+button.mini.danger:hover { background: #c94a44; }
+
+.aoi-classes { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-top: 5px; }
+.aoi-classes-side { font-size: 11px; color: var(--muted); min-width: 34px; }
+.aoi-class-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 1px 8px 1px 4px;
+}
+.aoi-class-chip .swatch { width: 10px; height: 10px; border-radius: 3px; border: 1px solid rgba(255,255,255,0.25); }
+
+/* --- AOI cards (redesign over the Stage 7c manager) -------------------------
+   Each AOI owns its bbox inputs, tools (check overlap / upload / clear), and
+   Run/Sample button. The ACTIVE card (accent ring) is the one map drawing and
+   uploads write into; click a card to make it active. */
+.aoi-card { cursor: pointer; }
+.aoi-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+/* Unused AOI: kept on disk but excluded from the model — dimmed. */
+.aoi-card.aoi-unused { opacity: 0.55; }
+.aoi-card.aoi-unused.active { opacity: 0.75; }
+
+/* Simple-list mode: a card is just "▸ name · tag" until expanded. */
+.aoi-head-left { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.aoi-expand {
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 5px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.aoi-expand:hover { color: var(--ink); background: transparent; }
+.aoi-card-body.collapsed { display: none; }
+.aoi-summary { margin: 6px 0 0; }
+
+/* Panel-head buttons: the ⓘ coverage dialog + "add AOI". */
+.aoi-head-actions { display: inline-flex; gap: 6px; align-items: center; }
+#aoi-info { font-size: 12px; padding: 4px 9px; }
+
+/* Coverage dialog: filter bar + one flat table (one class per row). */
+.coverage-filters { margin-top: 10px; gap: 14px; }
+.coverage-filters label.inline select { width: auto; padding: 4px 8px; font-size: 12px; }
+.coverage-table {
+  width: 100%;
+  margin-top: 10px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.coverage-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+}
+.coverage-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--ink);
+  vertical-align: middle;
+}
+.coverage-table td .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  margin-right: 2px;
+  vertical-align: baseline;
+}
+.coverage-table .cov-map { color: var(--muted); white-space: nowrap; }
+.coverage-table .cov-status.present { color: var(--strong); }
+.coverage-table .cov-status.absent { color: var(--orphan); }
+.aoi-tag {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-left: 8px;
+  white-space: nowrap;
+}
+.aoi-name-input { font-size: 12px; padding: 3px 6px; width: 15em; }
+.aoi-bbox {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin-top: 6px;
+}
+.aoi-bbox input { font-size: 11px; padding: 4px 6px; }
+.aoi-tools { margin-top: 6px; gap: 6px; align-items: center; }
+/* Per-auxiliary side targeting: whose absent classes this AOI samples. */
+label.aoi-target { margin-top: 6px; color: var(--muted); }
+label.aoi-target select { width: auto; padding: 3px 6px; font-size: 11px; }
+button.card-run { font-size: 12px; padding: 3px 12px; }
+/* The upload control is a <label> wrapping a hidden file input, styled to sit
+   with the mini buttons. */
+label.mini-upload {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  cursor: pointer;
+}
+label.mini-upload:hover { color: var(--ink); background: var(--raised); }
+
+/* --- Shared parameters + Run all (redesign) -------------------------------- */
+#param-panel { margin-top: 14px; }
+#param-panel .panel-head h2 {
+  font-size: 12px;
+  margin: 0;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#param-panel .row.aoi { margin-top: 6px; }
+#param-panel label.inline { margin-top: 8px; }
+#run-all-row { margin-top: 12px; }

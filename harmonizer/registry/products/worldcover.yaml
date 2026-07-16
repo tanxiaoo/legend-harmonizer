@@ -1,0 +1,103 @@
+# Product registry entry — single source of truth for this map's metadata and
+# legend (docs/PIPELINE.md, section 2.5). Adapters, overlap, tiles, matrix labels,
+# and CSV export all read map facts and legend (names, colours) from this file —
+# not from hardcoded values in config.py, affinity.py, tiles.py, or the frontend.
+
+id: worldcover
+display_name: ESA WorldCover v200 (global static 2021) [test-swap reference]
+provider: ESA
+role: reference          # reference | compare | embedding
+kind: label              # label | embedding
+
+access:
+  method: gee            # gee | local_raster
+  asset_id: ESA/WorldCover/v200
+  # ImageCollection with a single global 2021 image; take .first().
+  composite: first
+
+band: Map                # band holding the discrete class values
+resolution_m: 10.0
+available_years: [2021]
+crs: EPSG:4326
+
+# Declared/expected extent (advisory). WorldCover v200 is global, so this is null;
+# the authoritative footprint for sampling/overlap is derived from the source at
+# run time (section 2 / Stage 1 / Stage 5).
+footprint: null
+
+licence: CC-BY 4.0
+citation: >-
+  Zanaga, D. et al. (2022). ESA WorldCover 10 m 2021 v200.
+  https://doi.org/10.5281/zenodo.7254221
+
+# One entry per class. code = raw integer in the Map band. Descriptions are the
+# ESA WorldCover v200 Product User Manual class definitions (abridged).
+legend:
+  - code: 10
+    name: Tree cover
+    color: "#006400"
+    description: >-
+      Land dominated by trees: woody vegetation taller than ~5 m with a canopy
+      cover of at least 10%. Includes closed and open forests and tree plantations.
+  - code: 20
+    name: Shrubland
+    color: "#ffbb22"
+    description: >-
+      Woody perennial plants under ~5 m tall, with shrubs (not trees) dominant and
+      canopy cover above 10%. Trees and herbaceous plants may be present but are
+      not dominant.
+  - code: 30
+    name: Grassland
+    color: "#ffff4c"
+    description: >-
+      Herbaceous (non-woody) vegetation dominated by grasses and forbs, with woody
+      cover below 10%. Includes natural grasslands and managed pastures/meadows.
+  - code: 40
+    name: Cropland
+    color: "#f096ff"
+    description: >-
+      Land used for cultivated, harvestable crops (herbaceous and woody, incl.
+      croplands under agroforestry). Excludes perennial woody crops classed as
+      forest. Fallow and greenhouses may be included.
+  - code: 50
+    name: Built-up
+    color: "#fa0000"
+    description: >-
+      Land covered by buildings, roads and other artificial (sealed) surfaces —
+      urban and rural settlements, industrial areas and transport infrastructure.
+  - code: 60
+    name: Bare/sparse vegetation
+    color: "#b4b4b4"
+    description: >-
+      Bare soil, sand or rocks with little or no vegetation over the year;
+      vegetation cover never exceeds ~10%. Includes deserts and other barren land.
+  - code: 70
+    name: Snow and ice
+    color: "#f0f0f0"
+    description: >-
+      Land under permanent (year-round) cover of snow or ice, such as glaciers and
+      perennial snowfields.
+  - code: 80
+    name: Permanent water bodies
+    color: "#0064c8"
+    description: >-
+      Inland and marine open water present for most of the year — lakes,
+      reservoirs, rivers, lagoons and the sea. Excludes seasonally flooded wetland.
+  - code: 90
+    name: Herbaceous wetland
+    color: "#0096a0"
+    description: >-
+      Herbaceous vegetation on land permanently or regularly flooded by fresh,
+      brackish or salt water — marshes, swamps and bogs.
+  - code: 95
+    name: Mangroves
+    color: "#00cf75"
+    description: >-
+      Woody vegetation (trees/shrubs) growing in the intertidal zone of tropical
+      and subtropical coasts, flooded by salt or brackish water.
+  - code: 100
+    name: Moss and lichen
+    color: "#fae6a0"
+    description: >-
+      Land where mosses and lichens are the dominant vegetation, typical of tundra
+      and high-latitude or high-altitude environments.

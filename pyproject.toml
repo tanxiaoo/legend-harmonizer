@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legend-harmonizer"
+version = "0.1.0"
+description = "Harmonize the legends of two land-cover maps in AlphaEarth embedding space via per-class GMMs and Bures-Wasserstein affinity."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Xiao Tan", email = "xiaotan.scu@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "earthengine-api",
+    "rasterio",
+    "pyproj",
+    "geopandas",
+    "shapely",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "pyyaml",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+]
+
+[tool.setuptools.packages.find]
+include = ["harmonizer*"]

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Pipeline artifacts (keep the directories, ignore their contents)
+cache/*
+!cache/.gitkeep
+data/*
+!data/.gitkeep
+
+# Claude Code local settings
+.claude/
+
+# Reference material (not pushed to GitHub)
+links/
+
+
