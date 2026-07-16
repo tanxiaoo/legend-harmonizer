@@ -65,7 +65,7 @@ The ground distance between two single Gaussians $\mathcal{N}(m_1,\Sigma_1)$ and
 $\mathcal{N}(m_2,\Sigma_2)$ is the closed-form squared **2-Wasserstein
 (Bures–Wasserstein)** distance:
 
-$$W_2^2 = \lVert m_1 - m_2 \rVert^2 \;+\; \operatorname{Tr}\!\left(\Sigma_1 + \Sigma_2 - 2\left(\Sigma_1^{1/2}\,\Sigma_2\,\Sigma_1^{1/2}\right)^{1/2}\right)$$
+$$W_2^2 = \lVert m_1 - m_2 \rVert^2 + \mathrm{Tr}\left(\Sigma_1 + \Sigma_2 - 2\left(\Sigma_1^{1/2}\,\Sigma_2\,\Sigma_1^{1/2}\right)^{1/2}\right)$$
 
 — the squared gap between the means plus a covariance term comparing shape and
 orientation via a matrix square root. (Implemented in
