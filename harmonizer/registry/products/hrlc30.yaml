@@ -1,0 +1,109 @@
+# Product registry entry — single source of truth for this map's metadata and
+# legend (docs/PIPELINE.md, section 2.5). A second, real CCI HRLC local raster
+# alongside `hrlc.yaml`, proving the registry works for any local-raster product
+# and not only one hardcoded "HRLC" path.
+#
+# Legend confirmed against the actual file: at native resolution the raster
+# (ESACCI-HRLC-L4-MAP-CL01-A01MOSAIC-30m-P5Y-2019-fv01.2.tif) contains exactly
+# the codes below plus 0 (no label / background, not a legend class). Values seen
+# only when reading downsampled overviews (e.g. 61-69, 71-79) are resampling
+# artifacts of average-resampled overview pyramids, not real classes -- confirmed
+# in QGIS at native zoom and by a native-resolution rasterio window read. Do not
+# apply any code // 10 * 10 reduction; the raw codes below are already the final
+# classes (this AOI does not observe every class in the full 16-class FAO LCCS
+# legend -- absent codes 20, 40, 90, 110, 150 are legitimately not present here).
+
+id: hrlc30
+display_name: CCI HRLC 30m mosaic (Africa, 2019)
+provider: ESA CCI
+role: reference          # reference | compare | embedding
+kind: label               # label | embedding
+
+access:
+  method: local_raster
+  path: data/HRLC30/ESACCI-HRLC-L4-MAP-CL01-A01MOSAIC-30m-P5Y-2019-fv01.2.tif
+
+band: 1                  # first (and only) band of the class raster
+resolution_m: 30.0
+available_years: [2019]
+crs: EPSG:4326
+
+# Observed raster bounds (EPSG:4326), read directly from the file's rasterio
+# bounds. Advisory per section 2 -- the authoritative footprint is still derived
+# from the loaded source at run time.
+footprint: [26.0637, 3.5231, 43.2877, 16.2808]
+
+licence: ESA CCI data policy
+citation: >-
+  ESA Climate Change Initiative — High Resolution Land Cover (HRLC), 16-class
+  legend based on FAO LCCS. 30m Africa mosaic, 2019.
+
+# One entry per class actually observed in this raster (see note above). Names,
+# colours and descriptions reused from hrlc.yaml's FAO LCCS legend (same product
+# family/legend).
+legend:
+  - code: 10
+    name: Tree cover evergreen broadleaf
+    color: "#1a5b2c"
+    description: >-
+      Forest/woodland dominated by broadleaved trees that keep green foliage
+      year-round (evergreen), canopy taller than ~5 m.
+  - code: 30
+    name: Tree cover deciduous broadleaf
+    color: "#66bb6a"
+    description: >-
+      Forest/woodland dominated by broadleaved trees that shed their leaves
+      seasonally (deciduous), canopy taller than ~5 m.
+  - code: 50
+    name: Shrub cover evergreen
+    color: "#c8e6c9"
+    description: >-
+      Land dominated by evergreen shrubs — woody perennials under ~5 m that keep
+      foliage year-round.
+  - code: 60
+    name: Shrub cover deciduous
+    color: "#a5d6a7"
+    description: >-
+      Land dominated by deciduous shrubs — woody perennials under ~5 m that shed
+      leaves seasonally.
+  - code: 70
+    name: Grassland
+    color: "#f9e79f"
+    description: >-
+      Herbaceous vegetation dominated by grasses and forbs, with woody cover
+      below the shrub/tree threshold.
+  - code: 80
+    name: Croplands
+    color: "#f1c40f"
+    description: >-
+      Cultivated, harvestable crops — rainfed or irrigated herbaceous crops and
+      cropland mosaics.
+  - code: 100
+    name: Grassland vegetation aquatic or regularly flooded
+    color: "#85c1e9"
+    description: >-
+      Herbaceous vegetation on land that is aquatic or regularly flooded — marshes
+      and seasonally inundated grasslands.
+  - code: 120
+    name: Bare areas
+    color: "#e0e0e0"
+    description: >-
+      Bare soil, sand, gravel or rock with little to no vegetation over the year —
+      deserts and other barren land.
+  - code: 130
+    name: Built-up
+    color: "#e74c3c"
+    description: >-
+      Artificial (sealed) surfaces — buildings, roads and other urban/rural
+      settlement and infrastructure.
+  - code: 141
+    name: Open Water seasonal
+    color: "#3498db"
+    description: >-
+      Open water present for only part of the year — seasonally inundated water
+      bodies and ephemeral rivers/ponds.
+  - code: 142
+    name: Open Water permanent
+    color: "#2471a3"
+    description: >-
+      Open water present year-round — permanent lakes, rivers, reservoirs and sea.

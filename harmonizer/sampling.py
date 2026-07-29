@@ -203,13 +203,17 @@ def present_classes(label_image, region) -> list[int]:
     """
     import ee
 
-    hist = label_image.reduceRegion(
-        reducer=ee.Reducer.frequencyHistogram(),
-        geometry=region,
-        scale=_sample_scale_m() * 30,  # coarse: only need which classes exist
-        maxPixels=1e9,
-        bestEffort=True,
-    ).getInfo()
+    from harmonizer.registry.adapters._gee import get_info
+
+    hist = get_info(
+        label_image.reduceRegion(
+            reducer=ee.Reducer.frequencyHistogram(),
+            geometry=region,
+            scale=_sample_scale_m() * 30,  # coarse: only need which classes exist
+            maxPixels=1e9,
+            bestEffort=True,
+        )
+    )
     buckets = (hist or {}).get("label") or {}
     values = sorted(int(float(k)) for k in buckets.keys())
     return values
@@ -239,7 +243,9 @@ def _grid_cell_image(region, bbox: tuple[float, float, float, float] | None = No
 
 def region_bbox(region) -> tuple[float, float, float, float]:
     """(min_lon, min_lat, max_lon, max_lat) of an ee.Geometry, client-side."""
-    coords = region.bounds().coordinates().getInfo()[0]
+    from harmonizer.registry.adapters._gee import get_info
+
+    coords = get_info(region.bounds().coordinates())[0]
     lons = [c[0] for c in coords]
     lats = [c[1] for c in coords]
     return (min(lons), min(lats), max(lons), max(lats))
@@ -259,7 +265,7 @@ def _stratified_candidates(
     the overlap. Returns candidate coordinates only; label/embedding checks and
     min-spacing thinning happen in the caller.
     """
-    import ee
+    from harmonizer.registry.adapters._gee import get_info
 
     region = overlap.ee_geometry()
     mask = sampling_mask(label_image, class_value, erode_pixels=erode_pixels)
@@ -289,7 +295,7 @@ def _stratified_candidates(
         geometries=True,
         tileScale=16,
     )
-    info = fc.getInfo()
+    info = get_info(fc)
     coords: list[Coord] = []
     for feat in info.get("features", []):
         geom = feat.get("geometry") or {}
@@ -313,21 +319,23 @@ def _count_candidates_both(
     """
     import ee
 
+    from harmonizer.registry.adapters._gee import get_info
+
     region = overlap.ee_geometry()
     pre = sampling_mask(label_image, class_value, erode_pixels=0).rename("pre")
     post = sampling_mask(
         label_image, class_value, erode_pixels=erode_pixels
     ).rename("post")
     counts = (
-        pre.addBands(post)
-        .reduceRegion(
-            reducer=ee.Reducer.count(),
-            geometry=region,
-            scale=_sample_scale_m(),
-            maxPixels=1e10,
-            bestEffort=True,
+        get_info(
+            pre.addBands(post).reduceRegion(
+                reducer=ee.Reducer.count(),
+                geometry=region,
+                scale=_sample_scale_m(),
+                maxPixels=1e10,
+                bestEffort=True,
+            )
         )
-        .getInfo()
     ) or {}
     return (
         int(counts.get("pre", 0) or 0),
@@ -406,13 +414,23 @@ def _fetch_survivors(
 
 
 def sample_class(
-    label_image,
     class_value: int,
-    overlap: Overlap,
     label_adapter: LabelAdapter,
     embedding_adapter: EmbeddingAdapter,
+    *,
+    count_candidates_both,
+    draw_candidates,
 ) -> ClassSample:
-    """Sample one class end-to-end, applying the absent-vs-buffered-away rule."""
+    """Sample one class end-to-end, applying the absent-vs-buffered-away rule.
+
+    The GEE and local-raster paths share this exact logic and differ only in
+    *how* candidates are counted/drawn -- ``count_candidates_both(erode_pixels)
+    -> (pre, post)`` and ``draw_candidates(erode_pixels) -> list[Coord]`` are
+    passed in as closures over whichever image/window the caller built, so the
+    absent-vs-buffered-away rule is written once and applies identically to
+    both (docs/PIPELINE.md, Stage 2's rule is a single method, not one per
+    access type).
+    """
     cfg = CONFIG
     floor = cfg.sampling.points_floor
     target = cfg.sampling.points_target
@@ -420,15 +438,12 @@ def sample_class(
     result = ClassSample(class_value=int(class_value))
 
     # Candidate availability at both buffers (mask-pixel counts), for the rule.
-    # One combined round-trip instead of two (see _count_candidates_both).
-    result.pre_erode_candidates, result.post_erode_candidates = _count_candidates_both(
-        label_image, class_value, overlap, erode_pixels=cfg.buffering.erode_pixels
+    result.pre_erode_candidates, result.post_erode_candidates = count_candidates_both(
+        cfg.buffering.erode_pixels
     )
 
     def _draw(erode_pixels: int) -> tuple[list[Coord], list[list[float]], list[int]]:
-        cands = _stratified_candidates(
-            label_image, class_value, overlap, erode_pixels=erode_pixels, target=target
-        )
+        cands = draw_candidates(erode_pixels)
         cands = _thin_by_spacing(cands, cfg.sampling.min_spacing_m)
         cands = cands[:target]
         return _fetch_survivors(cands, label_adapter, embedding_adapter, class_value)
@@ -461,34 +476,16 @@ def sample_class(
 # --------------------------------------------------------------------------- #
 
 
-def sample_map(
+def _sample_map_gee(
     product_id: str,
-    overlap: Overlap | None = None,
-    aoi: tuple[float, float, float, float] | None = None,
-    label_adapter: LabelAdapter | None = None,
-    embedding_adapter: EmbeddingAdapter | None = None,
+    overlap: Overlap,
+    label_adapter: LabelAdapter,
+    embedding_adapter: EmbeddingAdapter,
 ) -> MapSample:
-    """Sample every class present in the overlap for one GEE label product.
-
-    When ``overlap`` is not given it is derived from the selected label product's
-    footprint intersected with AlphaEarth's, so the sampling region follows the
-    products in play rather than any single map's constant. For a global label
-    product (WorldCover, Dynamic World) this region is global. An optional ``aoi``
-    lon/lat box narrows that footprint-derived region without replacing it (e.g. a
-    small test AOI); it is ignored when an explicit ``overlap`` is passed.
-    """
-    overlap = overlap or overlap_for_products([product_id, "alphaearth"], aoi=aoi)
-
-    # This function issues server-side ee calls (present_classes, stratified
-    # sampling) directly, before any adapter runs, so Earth Engine must be
-    # initialised here rather than left to the adapters.
+    """The GEE-backed path: server-side image ops, coordinates cross the wire."""
     from harmonizer.registry.adapters._gee import ensure_initialized
 
     ensure_initialized()
-
-    reg = default_registry()
-    label_adapter = label_adapter or reg.get(product_id).adapter_factory()
-    embedding_adapter = embedding_adapter or reg.get("alphaearth").adapter_factory()
 
     # Build the annual label image once and clip it to the sampling region, so the
     # expensive composite (notably Dynamic World's year-long per-pixel mode) is
@@ -506,9 +503,99 @@ def sample_map(
     )
     for cv in classes:
         ms.classes[cv] = sample_class(
-            label_image, cv, overlap, label_adapter, embedding_adapter
+            cv,
+            label_adapter,
+            embedding_adapter,
+            count_candidates_both=lambda erode_pixels, cv=cv: _count_candidates_both(
+                label_image, cv, overlap, erode_pixels=erode_pixels
+            ),
+            draw_candidates=lambda erode_pixels, cv=cv: _stratified_candidates(
+                label_image,
+                cv,
+                overlap,
+                erode_pixels=erode_pixels,
+                target=CONFIG.sampling.points_target,
+            ),
         )
     return ms
+
+
+def _sample_map_local(
+    product_id: str,
+    spec,
+    overlap: Overlap,
+    label_adapter: LabelAdapter,
+    embedding_adapter: EmbeddingAdapter,
+) -> MapSample:
+    """The local-raster path (docs/PIPELINE.md Stage 2's deferred local path):
+    the AOI window is read into memory once and erosion/stratified sampling run
+    in-process against it (harmonizer.local_sampling), mirroring the GEE path's
+    logic exactly. Only coordinates and the AlphaEarth embedding still cross the
+    network -- the raster itself never leaves this process.
+    """
+    from harmonizer import local_sampling
+
+    band = int(spec.band) if spec.band is not None else 1
+    window = local_sampling.read_label_window(spec.access.path, band, overlap.bbox)
+    classes = local_sampling.present_classes(window)
+
+    ms = MapSample(
+        product_id=product_id,
+        working_year=CONFIG.maps.working_year,
+        floor=CONFIG.sampling.points_floor,
+        target=CONFIG.sampling.points_target,
+    )
+    for cv in classes:
+        ms.classes[cv] = sample_class(
+            cv,
+            label_adapter,
+            embedding_adapter,
+            count_candidates_both=lambda erode_pixels, cv=cv: local_sampling.count_candidates_both(
+                window, cv, erode_pixels=erode_pixels
+            ),
+            draw_candidates=lambda erode_pixels, cv=cv: local_sampling.stratified_candidates(
+                window,
+                cv,
+                overlap,
+                erode_pixels=erode_pixels,
+                target=CONFIG.sampling.points_target,
+            ),
+        )
+    return ms
+
+
+def sample_map(
+    product_id: str,
+    overlap: Overlap | None = None,
+    aoi: tuple[float, float, float, float] | None = None,
+    label_adapter: LabelAdapter | None = None,
+    embedding_adapter: EmbeddingAdapter | None = None,
+) -> MapSample:
+    """Sample every class present in the overlap for one label product.
+
+    When ``overlap`` is not given it is derived from the selected label product's
+    footprint intersected with AlphaEarth's, so the sampling region follows the
+    products in play rather than any single map's constant. For a global label
+    product (WorldCover, Dynamic World) this region is global. An optional ``aoi``
+    lon/lat box narrows that footprint-derived region without replacing it (e.g. a
+    small test AOI); it is ignored when an explicit ``overlap`` is passed.
+
+    Dispatches on the product's registry ``access.method``: a GEE product's
+    erosion/stratified-sampling runs server-side (``_sample_map_gee``); a
+    local-raster product's runs in-process against the file on disk
+    (``_sample_map_local``). Either way the embedding still comes from
+    AlphaEarth over GEE -- only the *label* source differs.
+    """
+    overlap = overlap or overlap_for_products([product_id, "alphaearth"], aoi=aoi)
+
+    reg = default_registry()
+    label_adapter = label_adapter or reg.get(product_id).adapter_factory()
+    embedding_adapter = embedding_adapter or reg.get("alphaearth").adapter_factory()
+
+    spec = reg.spec(product_id)
+    if spec.access.method == "local_raster":
+        return _sample_map_local(product_id, spec, overlap, label_adapter, embedding_adapter)
+    return _sample_map_gee(product_id, overlap, label_adapter, embedding_adapter)
 
 
 # --------------------------------------------------------------------------- #

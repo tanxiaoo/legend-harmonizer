@@ -1,0 +1,19 @@
+id: wsf
+display_name: World Settlement Footprint 2019 (Africa tiles, local)
+provider: DLR
+role: reference
+kind: label
+access:
+  method: local_raster
+  path: cache/vrt/wsf.vrt
+band: 1
+resolution_m: 8.983152841195215e-05
+available_years: [2019]
+crs: EPSG:4326
+footprint: [7.989975463072672, -2.0100702797458396, 44.010082736526776, 20.010062785290753]
+licence: "TODO: complete or confirm by hand"
+citation: "TODO: complete or confirm by hand"
+legend:
+  - {code: 0, name: "Non-settlements", color: "#c53939"}
+  - {code: 1, name: "Class 1", color: "#39c539"}
+  - {code: 255, name: "Settlements", color: "#3939c5", description: "all areas covered by: (i) buildings; (ii) buildings or building lots; and iii) buildings, building lots or roads/paved-surfaces. bcuilding as any structure having a roof supported by columns or walls and intended for the shelter, housing, or enclosure of any individual, animal, process, equipment, goods, or materials of any kind;building lot as the area contained within an enclosure (e.g., wall, fence, hedge) surrounding a building or a group of buildings; road as any long, narrow stretch with a smoothed or paved surface, made for traveling by motor vehicle, carriage, etc., between two or more points; paved surface as any level horizontal surface covered with paving material."}

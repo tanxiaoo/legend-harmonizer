@@ -1,0 +1,18 @@
+id: gfc
+display_name: JRC Global Forest Cover 2020 (Africa tiles, local)
+provider: JRC
+role: reference
+kind: label
+access:
+  method: local_raster
+  path: cache/vrt/gfc.vrt
+band: 1
+resolution_m: 8.333333333333333e-05
+available_years: [2019]
+crs: EPSG:4326
+footprint: [0.0, -10.0, 50.0, 20.0]
+licence: "TODO: complete or confirm by hand"
+citation: "TODO: complete or confirm by hand"
+legend:
+  - {code: 0, name: "Class 0", color: "#c53939"}
+  - {code: 1, name: "Forest", color: "#39c5c5", description: "“‘forest’ means land spanning more than 0.5 hectares with trees higher than 5 metres and a canopy cover of more than 10 %, or trees able to reach those thresholds in situ, excluding land that is predominantly under agricultural or urban land use;”"}

@@ -1,11 +1,17 @@
-"""HRLC local adapter (Stage 1).
+"""Local-raster adapter (Stage 1).
 
-Reads the CCI HRLC GeoTIFF from ``data/`` with rasterio. CRS alignment is this
+Reads a class-label GeoTIFF from disk with rasterio. CRS alignment is this
 adapter's responsibility: sample coordinates arrive in EPSG:4326 and must be
 transformed into the raster's own CRS before reading the pixel value. Fill/
 no-data values map to "no label". Getting the transform wrong silently returns
 neighbouring-pixel labels, so it is done explicitly here and exercised by the
 Stage 1 verification.
+
+Generic over which local-raster product it reads: every ``access.method:
+local_raster`` registry entry (CCI HRLC, or any other locally-held map) names its
+own concrete file via ``access.path`` (docs/PIPELINE.md, section 2.5), so this
+adapter takes that path directly rather than discovering "the" HRLC file in a
+shared directory -- there is no longer a single privileged local product.
 
 See docs/PIPELINE.md, Stage 1.
 """
@@ -23,55 +29,35 @@ from harmonizer.config import CONFIG
 from harmonizer.registry.products import Coord, LabelAdapter, LabelResult
 
 
-class HRLCLocalAdapter(LabelAdapter):
-    """Reads HRLC class labels from a local GeoTIFF via rasterio.
+class LocalRasterAdapter(LabelAdapter):
+    """Reads class labels from a local GeoTIFF via rasterio.
 
-    The GeoTIFF is discovered in the configured data directory. Coordinates are
-    transformed from EPSG:4326 into the raster CRS before pixel lookup. Points
-    outside the raster bounds, or reading a nodata value, return a masked
-    :class:`LabelResult`.
+    Coordinates are transformed from EPSG:4326 into the raster CRS before pixel
+    lookup. Points outside the raster bounds, or reading a nodata value, return a
+    masked :class:`LabelResult`.
     """
 
-    name = "hrlc-local"
+    name = "local-raster"
 
-    def __init__(self, tif_path: str | Path | None = None) -> None:
-        self._tif_path = Path(tif_path) if tif_path is not None else self._find_tif()
+    def __init__(self, tif_path: str | Path) -> None:
+        self._tif_path = Path(tif_path)
         # Opened lazily on first sample so constructing the adapter is cheap and
-        # never fails just because a file has not been dropped in yet.
+        # never touches the file until it's actually needed.
         self._dataset = None
         self._transformer: Transformer | None = None
 
     # ------------------------------------------------------------------ #
-    # Discovery / setup
+    # Setup
     # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _find_tif() -> Path:
-        """Locate the single HRLC GeoTIFF in the configured data directory."""
-        data_dir: Path = CONFIG.maps.hrlc_data_dir
-        candidates = sorted(
-            p
-            for ext in ("*.tif", "*.tiff", "*.TIF", "*.TIFF")
-            for p in data_dir.glob(ext)
-        )
-        if not candidates:
-            raise FileNotFoundError(
-                f"No HRLC GeoTIFF (*.tif/*.tiff) found in {data_dir}. "
-                "Place the CCI HRLC raster there (see docs/PIPELINE.md, section 4)."
-            )
-        if len(candidates) > 1:
-            # Deterministic choice, but warn via the exception message contract:
-            # downstream expects exactly one reference raster in the MVP.
-            names = ", ".join(p.name for p in candidates)
-            raise ValueError(
-                f"Multiple GeoTIFFs found in {data_dir} ({names}); "
-                "keep exactly one HRLC raster, or pass tif_path explicitly."
-            )
-        return candidates[0]
 
     def _ensure_open(self) -> None:
         if self._dataset is not None:
             return
+        if not self._tif_path.is_file():
+            raise FileNotFoundError(
+                f"local-raster file not found: {self._tif_path} "
+                "(check the product's access.path in its registry YAML)."
+            )
         self._dataset = rasterio.open(self._tif_path)
         # Transform EPSG:4326 -> raster CRS. always_xy keeps (lon, lat) order so
         # inputs and outputs are unambiguously (x=lon, y=lat).
@@ -141,7 +127,7 @@ class HRLCLocalAdapter(LabelAdapter):
             self._dataset.close()
             self._dataset = None
 
-    def __enter__(self) -> "HRLCLocalAdapter":
+    def __enter__(self) -> "LocalRasterAdapter":
         self._ensure_open()
         return self
 

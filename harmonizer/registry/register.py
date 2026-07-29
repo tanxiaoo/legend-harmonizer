@@ -164,6 +164,16 @@ class Detected:
     class_colors: dict[int, str] = field(default_factory=dict)
 
 
+#: Reading a whole band at full resolution is fine for a single tile (HRLC-scale,
+#: a few billion pixels at most) but a mosaicked VRT over a whole continent can be
+#: two orders of magnitude larger and OOMs a full read. Above this many pixels,
+#: scan a decimated (overview-resolution) copy instead -- code *detection* only
+#: needs to see every value that exists somewhere, not read every pixel, and a
+#: missed rare code still surfaces later as "undeclared" by the reconciliation
+#: check rather than silently disappearing.
+_FULL_READ_PIXEL_LIMIT = 50_000_000
+
+
 def detect_local_raster(path: str | Path, band: int = 1) -> Detected:
     """Auto-detect CRS, footprint, resolution, codes, and any embedded colour
     table / category names from a local GeoTIFF."""
@@ -188,8 +198,15 @@ def detect_local_raster(path: str | Path, band: int = 1) -> Detected:
             det.footprint = (min(xs), min(ys), max(xs), max(ys))
         except Exception:  # pragma: no cover - defensive
             det.footprint = None
-        # Class codes actually present.
-        data = ds.read(band)
+        # Class codes actually present. Full read for a normal-sized source;
+        # decimated for a continent-scale mosaic (see _FULL_READ_PIXEL_LIMIT).
+        total_pixels = ds.width * ds.height
+        if total_pixels > _FULL_READ_PIXEL_LIMIT:
+            decimation = (total_pixels / _FULL_READ_PIXEL_LIMIT) ** 0.5
+            out_shape = (1, max(1, int(ds.height / decimation)), max(1, int(ds.width / decimation)))
+            data = ds.read(band, out_shape=out_shape, resampling=rasterio.enums.Resampling.nearest)
+        else:
+            data = ds.read(band)
         vals = np.unique(data)
         if ds.nodata is not None:
             vals = vals[vals != ds.nodata]
@@ -317,14 +334,15 @@ def build_registration_yaml(
 def _resolve_local_path(spec: ProductSpec) -> Path:
     """The GeoTIFF path for a local-raster product.
 
-    Uses the spec's ``access.path`` when it points at a file; if it names a
-    directory (or the advisory ``data/``), fall back to the local adapter's tile
-    discovery so reconciliation works against whatever tile is actually present.
+    Every local-raster product declares its own concrete file via ``access.path``
+    (docs/PIPELINE.md, section 2.5) -- there is no shared directory to search,
+    since two local products could otherwise collide on which file "the" local
+    raster means.
     """
     raw = spec.access.path
     p = Path(raw) if raw else None
-    if p is not None and p.is_file():
-        return p
-    from harmonizer.registry.adapters.hrlc_local import HRLCLocalAdapter
-
-    return HRLCLocalAdapter().tif_path
+    if p is None or not p.is_file():
+        raise FileNotFoundError(
+            f"{spec.id!r}: access.path does not point at an existing file: {raw!r}"
+        )
+    return p

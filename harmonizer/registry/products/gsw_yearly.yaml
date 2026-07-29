@@ -1,0 +1,20 @@
+id: gsw_yearly
+display_name: JRC Global Surface Water, yearly classification (Africa tiles, local, 2019)
+provider: JRC
+role: reference
+kind: label
+access:
+  method: local_raster
+  path: cache/vrt/gsw_yearly.vrt
+band: 1
+resolution_m: 0.00025
+available_years: [2019]
+crs: EPSG:4326
+footprint: [-20.0, 0.0, 50.0, 20.0]
+licence: "TODO: complete or confirm by hand"
+citation: "TODO: complete or confirm by hand"
+legend:
+  - {code: 0, name: "No observations", color: "#c53939", description: "-"}
+  - {code: 1, name: "Not water", color: "#7fc539", description: "Other"}
+  - {code: 2, name: "Seasonal water", color: "#39c5c5", description: "Seasonal water surface is underwater for less than 12 months of the year"}
+  - {code: 3, name: "Permanent water", color: "#7f39c5", description: "Permanent water surface is underwater throughout the year"}

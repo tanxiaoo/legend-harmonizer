@@ -510,7 +510,9 @@ def _draw_declustered(mask, overlap: Overlap, scale_m: float, n: int) -> list[Co
         geometries=True,
         tileScale=16,
     )
-    info = fc.getInfo()
+    from harmonizer.registry.adapters._gee import get_info
+
+    info = get_info(fc)
     coords: list[Coord] = []
     for feat in info.get("features", []):
         geom = feat.get("geometry") or {}

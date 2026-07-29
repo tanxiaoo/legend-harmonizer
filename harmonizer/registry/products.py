@@ -181,20 +181,35 @@ class Registry:
         return [p for p in self._products.values() if p.kind == kind]
 
 
-#: Maps a registry product id to the adapter factory that reads it. Adapters are
+#: Maps a registry spec to the adapter factory that reads it. Adapters are
 #: imported lazily inside the factories so importing this module never requires
 #: rasterio or GEE to be available. The adapters themselves read their asset id /
 #: band / resolution from the product's ProductSpec (single source of truth).
-def _adapter_factory_for(product_id: str):
+#:
+#: Local-raster products (``access.method == "local_raster"``) are dispatched
+#: generically: any such product gets a :class:`LocalRasterAdapter` pointed at its
+#: own declared ``access.path``, with no per-product-id wiring needed -- adding a
+#: second (or third) local raster is purely a matter of adding its YAML file. GEE
+#: products still need one factory per asset, because each GEE dataset's image
+#: shape (single static image vs. an annual composite) differs and that shape
+#: isn't yet expressed in the registry schema (docs/PIPELINE.md section 2.5 covers
+#: asset id/band/footprint but not compositing logic); see ``sampling.py`` for the
+#: same per-id dispatch on the Stage 2 side.
+def _adapter_factory_for(spec: ProductSpec):
+    if spec.access.method == "local_raster":
+        path = spec.access.path
+
+        def _local_raster():
+            from harmonizer.registry.adapters.hrlc_local import LocalRasterAdapter
+
+            return LocalRasterAdapter(path)
+
+        return _local_raster
+
     def _worldcover():
         from harmonizer.registry.adapters.worldcover_gee import WorldCoverAdapter
 
         return WorldCoverAdapter()
-
-    def _hrlc():
-        from harmonizer.registry.adapters.hrlc_local import HRLCLocalAdapter
-
-        return HRLCLocalAdapter()
 
     def _dynamicworld():
         from harmonizer.registry.adapters.dynamicworld_gee import DynamicWorldAdapter
@@ -206,13 +221,12 @@ def _adapter_factory_for(product_id: str):
 
         return AlphaEarthAdapter()
 
-    factories = {
+    gee_factories = {
         "worldcover": _worldcover,
-        "hrlc": _hrlc,
         "dynamicworld": _dynamicworld,
         "alphaearth": _alphaearth,
     }
-    return factories.get(product_id)
+    return gee_factories.get(spec.id)
 
 
 def default_registry() -> Registry:
@@ -221,15 +235,16 @@ def default_registry() -> Registry:
     The files in ``harmonizer/registry/products/`` are the single source of truth:
     each becomes a :class:`Product` whose metadata and legend come from the parsed
     :class:`ProductSpec`, paired with the adapter factory that knows how to read
-    it. For the current test swap WorldCover is the reference; Dynamic World the
-    compare; AlphaEarth the embedding; HRLC remains registered as the eventual real
-    reference. A YAML file without a known adapter is registered with no factory so
-    its metadata/legend are still available (e.g. for reconciliation).
+    it. Any product is fair game as reference or compare -- role is a per-run
+    choice (which id the caller passes as ``reference_id``/``compare_id``), not
+    fixed by the registry. A YAML file without a known adapter (an unrecognised GEE
+    asset id) is registered with no factory so its metadata/legend are still
+    available (e.g. for reconciliation).
     """
 
     reg = Registry()
     for product_id, spec in load_all_products().items():
         reg.register(
-            Product(spec=spec, adapter_factory=_adapter_factory_for(product_id))
+            Product(spec=spec, adapter_factory=_adapter_factory_for(spec))
         )
     return reg
