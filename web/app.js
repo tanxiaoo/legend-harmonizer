@@ -132,11 +132,14 @@ async function init() {
   const data = await getJSON("/api/products");
   CALIBRATION = data.calibration;
 
+  // Every label product is offered on BOTH sides — role is advisory metadata,
+  // not an enforced pairing constraint (any product may be reference or
+  // compare), so the two dropdowns must list the same set. Each option is
+  // tagged with its source (local raster vs GEE) so the user can tell them
+  // apart before picking.
   const labels = data.products.filter((p) => p.kind === "label");
-  const refs = labels.filter((p) => p.role === "reference");
-  const cmps = labels.filter((p) => p.role === "compare");
-  fillSelect($("reference"), refs);
-  fillSelect($("compare"), cmps);
+  fillSelect($("reference"), labels);
+  fillSelect($("compare"), labels);
 
   $("year-note").textContent = `working year ${data.working_year}`;
   $("sample_scale_m").value = data.defaults.sample_scale_m;
@@ -167,7 +170,8 @@ function fillSelect(sel, products) {
   for (const p of products) {
     const opt = document.createElement("option");
     opt.value = p.id;
-    opt.textContent = p.name;
+    const tag = p.source === "local_raster" ? "local" : "GEE";
+    opt.textContent = `[${tag}] ${p.name}`;
     sel.appendChild(opt);
   }
 }
@@ -323,10 +327,40 @@ async function loadTiles(side) {
   const qs = values.length ? `?classes=${values.join(",")}` : "?classes=";
   status.textContent = `Loading ${productName(pid)} tiles…`;
   try {
-    const { template } = await getJSON(`/api/tiles/${pid}${qs}`);
-    if (LABEL_LAYERS[side]) map.removeLayer(LABEL_LAYERS[side]);
-    LABEL_LAYERS[side] = L.tileLayer(template, { opacity: 0.85 }).addTo(map);
-    status.textContent = "";
+    const { template, max_native_zoom: maxNativeZoom } = await getJSON(
+      `/api/tiles/${pid}${qs}`
+    );
+
+    // Add the new layer *before* removing the old one and only drop the old one
+    // once the new tiles have actually arrived. Removing first left the map
+    // blank for the whole fetch, which is what made switching maps feel slow
+    // even when the tiles themselves were quick.
+    const previous = LABEL_LAYERS[side];
+    const layer = L.tileLayer(template, {
+      opacity: 0.85,
+      // Keep a ring of off-screen tiles so a small pan re-uses them instead of
+      // re-requesting, and hold already-drawn tiles while new ones load.
+      keepBuffer: 4,
+      updateWhenIdle: false,
+      updateWhenZooming: false,
+      // Past the data's real resolution the browser upscales tiles it already
+      // has rather than requesting finer ones the raster cannot fill. The cap
+      // comes from the product's own metadata, not a fixed number, because
+      // these products differ in ground resolution.
+      ...(maxNativeZoom != null ? { maxNativeZoom, maxZoom: 22 } : {}),
+      className: "label-layer",
+    });
+
+    const dropPrevious = () => {
+      if (previous && map.hasLayer(previous)) map.removeLayer(previous);
+      status.textContent = "";
+    };
+    layer.on("load", dropPrevious);
+    // 'load' does not fire when every tile is served from cache, so guarantee
+    // the swap completes either way.
+    setTimeout(dropPrevious, 2000);
+
+    LABEL_LAYERS[side] = layer.addTo(map);
   } catch (e) {
     status.className = "note error";
     status.textContent = `Could not load ${productName(pid)} tiles: ${e.message}`;

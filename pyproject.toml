@@ -13,6 +13,11 @@ requires-python = ">=3.10"
 dependencies = [
     "earthengine-api",
     "rasterio",
+    "rio-tiler",
+    # COG conversion and the per-product tile index (tools/to_cog.py)
+    "rio-cogeo",
+    "cogeo-mosaic",
+    "Pillow",
     "pyproj",
     "geopandas",
     "shapely",

@@ -11,6 +11,7 @@ Nothing in this module does work; it only holds configuration.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -20,6 +21,18 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
 CACHE_DIR = REPO_ROOT / "cache"
+
+# Converted Cloud-Optimized GeoTIFFs and their MosaicJSON indexes
+# (``tools/to_cog.py``). This tree is *derived* data -- it can always be rebuilt
+# from ``data/`` -- but it is large (comparable to the source rasters), so it
+# deliberately does not live under ``cache/`` in the repo: this deployment's home
+# filesystem has a 50 GB quota that is already ~95% full, and one uncompressed
+# ``.ovr`` sidecar built there previously reached 41 GB on its own. Point
+# ``HARMONIZER_COG_DIR`` at a volume with room (on Leonardo, the project work
+# area) and keep the repo checkout small.
+COG_DIR = Path(
+    os.environ.get("HARMONIZER_COG_DIR", str(CACHE_DIR / "cog"))
+).expanduser()
 
 
 # --------------------------------------------------------------------------- #
@@ -37,10 +50,6 @@ class MapsConfig:
     source of truth. This class keeps only settings that are shared across maps or
     belong to the *run* rather than to any one map.
     """
-
-    # Where a local reference raster (HRLC) is dropped. The specific tile/path is a
-    # per-map fact in the registry; this is only the default search directory.
-    hrlc_data_dir: Path = DATA_DIR
 
     # Embedding dimensionality (AlphaEarth), used to reshape sampled vectors. The
     # embedding source's asset id lives in the registry (alphaearth.yaml).
@@ -233,6 +242,7 @@ class Config:
 
     data_dir: Path = DATA_DIR
     cache_dir: Path = CACHE_DIR
+    cog_dir: Path = COG_DIR
 
 
 # Default singleton other modules import.

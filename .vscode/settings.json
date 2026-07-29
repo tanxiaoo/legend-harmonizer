@@ -1,0 +1,13 @@
+{
+  // The app runs on a Leonardo login node and binds to 127.0.0.1 there, so the
+  // browser on your laptop cannot reach it directly. VS Code Remote-SSH tunnels
+  // this port over the existing SSH connection, which makes
+  // http://127.0.0.1:8137 work locally.
+  "remote.portsAttributes": {
+    "8137": {
+      "label": "Legend Harmonizer",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "remote.autoForwardPorts": true
+}

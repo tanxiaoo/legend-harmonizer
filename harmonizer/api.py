@@ -61,6 +61,7 @@ caches, and the merged matching table whose rows carry ``evidence_aoi``:
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import traceback
 import uuid
@@ -69,7 +70,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -87,7 +88,7 @@ from harmonizer.pipeline import (
     run_sampling,
 )
 from harmonizer.registry.products import default_registry
-from harmonizer import tiles
+from harmonizer import local_tiles, tiles
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -299,13 +300,35 @@ class UnconfirmRequest(BaseModel):
 app = FastAPI(title="Legend Harmonizer", version="0.1.0")
 
 
+def _local_raster_ready(spec) -> bool:
+    """True if a local_raster product's declared file actually exists.
+
+    Filters out placeholder registry entries (``access.path`` still a TODO/
+    directory, no file dropped yet) from what the UI offers, so a product only
+    appears once it's actually usable.
+    """
+    if spec.access.method != "local_raster":
+        return True
+    from pathlib import Path
+
+    p = spec.access.path
+    return bool(p) and Path(p).is_file()
+
+
 @app.get("/api/products")
 def list_products() -> dict:
     """The registry's products, so the UI offers only valid pairings."""
     reg = default_registry()
     products = [
-        {"id": p.id, "name": p.name, "kind": p.kind, "role": p.role}
+        {
+            "id": p.id,
+            "name": p.name,
+            "kind": p.kind,
+            "role": p.role,
+            "source": p.spec.access.method,  # "local_raster" | "gee"
+        }
         for p in reg.all()
+        if _local_raster_ready(p.spec)
     ]
     return {
         "products": products,
@@ -464,11 +487,20 @@ def footprints(
     }
 
 
+def _is_local_raster(product_id: str) -> bool:
+    reg = default_registry()
+    try:
+        return reg.spec(product_id).access.method == "local_raster"
+    except KeyError:
+        return False
+
+
 @app.get("/api/legend/{product_id}")
 def legend(product_id: str) -> dict:
     """A product's class legend (value/name/colour) for the per-class toggles."""
+    renderer = local_tiles if _is_local_raster(product_id) else tiles
     try:
-        entries = tiles.legend(product_id)
+        entries = renderer.legend(product_id)
     except KeyError as exc:
         raise HTTPException(
             status_code=404, detail=f"no legend for product: {product_id}"
@@ -487,22 +519,47 @@ def legend(product_id: str) -> dict:
     }
 
 
+def _parse_classes(classes: str | None) -> list[int] | None:
+    if classes is None or classes.strip() == "":
+        return None
+    try:
+        return [int(v) for v in classes.split(",") if v.strip() != ""]
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"invalid classes list: {classes}"
+        ) from exc
+
+
 @app.get("/api/tiles/{product_id}")
 def label_tiles(product_id: str, classes: str | None = None) -> dict:
     """An XYZ tile-URL template for the product's label map.
 
     ``classes`` is an optional comma-separated list of class values to render
-    (the per-class show/hide toggles); omit it to render every class. The rasters
-    stay on Earth Engine and stream as tiles straight to the browser.
+    (the per-class show/hide toggles); omit it to render every class. GEE-backed
+    products stream tiles straight from Earth Engine to the browser; local-raster
+    products are rendered by this process and served from
+    ``/api/tiles/local/{product}/{z}/{x}/{y}.png`` -- either way the frontend gets
+    back an opaque XYZ template it can hand straight to Leaflet.
     """
-    visible = None
-    if classes is not None and classes.strip() != "":
+    visible = _parse_classes(classes)
+    if _is_local_raster(product_id):
         try:
-            visible = [int(v) for v in classes.split(",") if v.strip() != ""]
-        except ValueError as exc:
+            local_tiles.legend(product_id)  # validates the product up front
+        except KeyError as exc:
             raise HTTPException(
-                status_code=400, detail=f"invalid classes list: {classes}"
+                status_code=404, detail=f"no tiles for product: {product_id}"
             ) from exc
+        template = f"/api/tiles/local/{product_id}/{{z}}/{{x}}/{{y}}.png"
+        if visible is not None:
+            template += "?classes=" + ",".join(str(v) for v in visible)
+        # Let the frontend upscale in the browser past the data's real
+        # resolution instead of requesting finer tiles the raster cannot fill.
+        return {
+            "product_id": product_id,
+            "template": template,
+            "max_native_zoom": local_tiles.max_native_zoom(product_id),
+        }
+
     try:
         template = tiles.tile_template(product_id, visible_values=visible)
     except KeyError as exc:
@@ -510,6 +567,77 @@ def label_tiles(product_id: str, classes: str | None = None) -> dict:
             status_code=404, detail=f"no tiles for product: {product_id}"
         ) from exc
     return {"product_id": product_id, "template": template}
+
+
+@app.get("/api/tiles/local/{product_id}/{z}/{x}/{y}.png")
+def local_tile_png(
+    request: Request,
+    product_id: str,
+    z: int,
+    x: int,
+    y: int,
+    classes: str | None = None,
+) -> Response:
+    """A rendered PNG tile for a local-raster product's label map.
+
+    The counterpart of GEE tile streaming for products this process reads
+    directly from disk (docs/PIPELINE.md, Stage 5.2) -- see ``local_tiles.py``.
+
+    Tiles are immutable for a given (product, z/x/y, class selection): the class
+    codes only change when the underlying raster is replaced and reconverted. So
+    the response carries a long ``Cache-Control`` and an ``ETag``, which lets the
+    browser re-show a layer the user has already viewed without another request
+    -- the difference between toggling layers feeling instant and re-rendering
+    every tile each time. ``_tile_etag`` changes if the product's legend changes,
+    so a recoloured legend is not served stale.
+    """
+    visible = _parse_classes(classes)
+    try:
+        etag = _tile_etag(product_id, z, x, y, visible)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"no tiles for product: {product_id}"
+        ) from exc
+
+    headers = {
+        "Cache-Control": "public, max-age=604800",  # one week
+        "ETag": etag,
+    }
+    # The browser already holds this exact tile: skip rendering entirely.
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+
+    try:
+        png = local_tiles.tile_png(product_id, z, x, y, visible_values=visible)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"no tiles for product: {product_id}"
+        ) from exc
+    except local_tiles.TileOutsideBounds as exc:
+        # Leaflet requests every tile in the viewport regardless of a regional
+        # product's actual extent; a tile outside it simply doesn't exist here.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(content=png, media_type="image/png", headers=headers)
+
+
+def _tile_etag(
+    product_id: str, z: int, x: int, y: int, visible: list[int] | None
+) -> str:
+    """A cache validator for one rendered tile.
+
+    Covers everything that changes the PNG's bytes: the tile address, the
+    selected class subset, and the product's legend (values and colours). Raises
+    ``KeyError`` for a product that has no drawable legend, so an unknown product
+    still 404s before any rendering work.
+    """
+    entries = local_tiles.legend(product_id)
+    parts = [
+        product_id,
+        f"{z}/{x}/{y}",
+        ",".join(str(v) for v in sorted(visible)) if visible is not None else "all",
+        ";".join(f"{e.value}:{e.color}" for e in entries),
+    ]
+    return '"' + hashlib.sha1("|".join(parts).encode()).hexdigest()[:16] + '"'
 
 
 def _execute(job_id: str) -> None:
