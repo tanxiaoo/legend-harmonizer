@@ -2048,6 +2048,23 @@ function currentAlpha() {
   return ALPHA == null ? (ALPHA_DEFAULT == null ? 0 : ALPHA_DEFAULT) : ALPHA;
 }
 
+// Selecting a different map ends the comparison the alpha applied to, so the
+// setting does not carry over: alpha weights a prior built from THIS pair's two
+// legends, and a value chosen while looking at one crosswalk means nothing
+// against another. Back to the calibrated default, and the control is disabled
+// until the new pair has a run to re-decide from.
+function resetAlphaForNewPair() {
+  if (ALPHA == null) return; // never touched; nothing to reset
+  ALPHA = null;
+  $("alpha-compare").checked = false;
+  paintAlpha();
+  setAlphaEnabled(false);
+  // The tables on screen describe the OLD pair, so clear them rather than
+  // leave rows that no longer match the selected maps.
+  RESULTS = null;
+  renderCsvView();
+}
+
 // True when the current pair has auxiliary AOIs, in which case the deliverable
 // is the MERGED table rather than the primary-only rows (Stage 7.4).
 function hasAuxiliaries() {
@@ -3780,10 +3797,12 @@ $("csv-pick").addEventListener("change", renderCsvView);
 
 // Switching a product reloads that side's tiles/legend and redraws footprints.
 $("reference").addEventListener("change", async () => {
+  resetAlphaForNewPair();
   await refreshMapSide("ref");
   await refreshFootprints();
 });
 $("compare").addEventListener("change", async () => {
+  resetAlphaForNewPair();
   await refreshMapSide("cmp");
   await refreshFootprints();
 });
