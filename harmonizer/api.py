@@ -2238,5 +2238,28 @@ def review_unconfirm(req: UnconfirmRequest) -> dict:
 
 
 # The static one-page frontend. Mounted last so /api/* wins.
+#
+# Served with caching DISABLED. This is a local, single-user app whose frontend
+# is edited in place: the default StaticFiles ETag/Last-Modified handling makes
+# a browser reuse its cached app.js after the file has changed, so a UI fix
+# appears not to work and the only clue is stale behaviour with no error. The
+# files are a few hundred KB served from localhost, so re-sending them costs
+# nothing next to that confusion.
+class _NoCacheStaticFiles(StaticFiles):
+    def is_not_modified(self, response_headers, request_headers) -> bool:
+        # Never answer 304: always send the current bytes.
+        return False
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+        # Starlette's MutableHeaders has no .pop(); delete only if present, or
+        # __delitem__ raises KeyError.
+        for h in ("etag", "last-modified"):
+            if h in resp.headers:
+                del resp.headers[h]
+        return resp
+
+
 if WEB_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+    app.mount("/", _NoCacheStaticFiles(directory=str(WEB_DIR), html=True), name="web")
