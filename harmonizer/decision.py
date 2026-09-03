@@ -128,6 +128,57 @@ class ClassDecision:
     absence_reason: str = ""
     # Full normalised probability row over compare classes, for the table split.
     probabilities: dict[int, float] = field(default_factory=dict)
+    # -- Stage 8b: semantic prior ------------------------------------------- #
+    #: Best semantic fit for this row and the class it points at. Reported
+    #: whatever alpha is, so the definition-level view is always visible.
+    best_semantic_value: int = -1
+    best_semantic_name: str = ""
+    best_semantic_prior: float = float("nan")
+    #: True when the row's best prior is below ``semantic_orphan_floor``: no
+    #: compare class's *definition* fits this one, independent of the pixels.
+    semantic_orphan: bool = False
+    #: argmax of the unfused (alpha = 0) row, so a fused decision can be compared
+    #: against what the observational pipeline alone would have said.
+    aef_best_compare_value: int = -1
+    #: agree | semantic_overrides | aef_only | both_orphan (see ``_agreement``).
+    agreement: str = ""
+
+
+def _agreement(
+    *,
+    status: str,
+    semantic_orphan: bool,
+    fused_best: int,
+    aef_best: int,
+) -> str:
+    """How the observational and semantic signals relate on one row.
+
+    Four outcomes, and each says something different about the row:
+
+    * ``both_orphan`` -- neither the pixels nor the definitions find a match.
+      The strongest evidence of a genuine legend divergence.
+    * ``aef_only`` -- the pixels match something but no definition does
+      (``semantic_orphan``). Typically spectral confusion: the class looks like
+      its neighbour without meaning the same thing.
+    * ``semantic_overrides`` -- the definitions find a match the pixels do not,
+      or the prior moved the winner away from what the distances alone chose.
+      The first case is definition drift (an observational orphan whose meaning
+      *does* correspond); the second is the prior actively changing an answer.
+      These are the rows Stage 8 exists to surface, and the ones to review first.
+    * ``agree`` -- both signals point at the same compare class.
+    """
+    observational_orphan = status == "orphan"
+    if observational_orphan and semantic_orphan:
+        return "both_orphan"
+    if semantic_orphan:
+        return "aef_only"
+    # An observational orphan that is not a semantic orphan is definition drift:
+    # nothing looks like this class, yet some class means the same thing.
+    if observational_orphan:
+        return "semantic_overrides"
+    if fused_best != aef_best:
+        return "semantic_overrides"
+    return "agree"
 
 
 def classify_rows(
@@ -200,6 +251,29 @@ def classify_rows(
         else:
             status = "mixed"
 
+        # Stage 8b: the semantic view of the same row, reported alongside the
+        # observational one. None of it changes `status` -- orphans stay
+        # observational by design (docs/PIPELINE.md, Stage 8).
+        sem_value, sem_name, sem_best = -1, "", float("nan")
+        sem_orphan = False
+        if aff.semantic_prior is not None and aff.semantic_prior.shape[1]:
+            sem_row = aff.semantic_prior[i]
+            sem_j = int(np.argmax(sem_row))
+            sem_value = aff.compare_classes[sem_j]
+            sem_name = class_name(aff.compare_id, sem_value)
+            sem_best = float(sem_row[sem_j])
+            if aff.semantic_orphan is not None:
+                sem_orphan = bool(aff.semantic_orphan[i])
+
+        # What the unfused (alpha = 0) row would have chosen. Ranked by
+        # probability, matching how the fused winner is read below.
+        aef_best = best_cc
+        if aff.normalized_affinity_aef is not None and aff.normalized_affinity_aef.shape[1]:
+            aef_best = aff.compare_classes[int(np.argmax(aff.normalized_affinity_aef[i]))]
+        fused_best = (
+            aff.compare_classes[int(np.argmax(prob_row))] if prob_row.size else best_cc
+        )
+
         decisions.append(
             ClassDecision(
                 reference_value=rc,
@@ -216,6 +290,17 @@ def classify_rows(
                     cc: float(prob_row[j])
                     for j, cc in enumerate(aff.compare_classes)
                 },
+                best_semantic_value=sem_value,
+                best_semantic_name=sem_name,
+                best_semantic_prior=sem_best,
+                semantic_orphan=sem_orphan,
+                aef_best_compare_value=aef_best,
+                agreement=_agreement(
+                    status=status,
+                    semantic_orphan=sem_orphan,
+                    fused_best=fused_best,
+                    aef_best=aef_best,
+                ),
             )
         )
 
@@ -298,6 +383,13 @@ class MatchingRow:
     # Probabilities normalise within the named AOI's sub-matrix, so rows are
     # only comparable to other rows carrying the same tag (docs 7.4).
     evidence_aoi: str = "primary"
+    # -- Stage 8b: semantic prior (reported, never replacing ``status``) ------ #
+    best_semantic_value: int = -1
+    best_semantic_name: str = ""
+    best_semantic_prior: float = float("nan")
+    semantic_orphan: bool = False
+    aef_best_compare_value: int = -1
+    agreement: str = ""
 
 
 def _rank_candidates(
@@ -368,6 +460,12 @@ def build_matching_table(
                 reference_low_confidence=d.low_confidence,
                 compare_low_confidence=low_conf,
                 absence_reason=d.absence_reason,
+                best_semantic_value=d.best_semantic_value,
+                best_semantic_name=d.best_semantic_name,
+                best_semantic_prior=d.best_semantic_prior,
+                semantic_orphan=d.semantic_orphan,
+                aef_best_compare_value=d.aef_best_compare_value,
+                agreement=d.agreement,
             )
         )
 
@@ -483,6 +581,13 @@ def save_matching_table_csv(
                 "entropy",
                 "reference_low_confidence",
                 "compare_low_confidence",
+                # Stage 8b: the semantic view, beside the observational one.
+                "best_semantic_value",
+                "best_semantic_name",
+                "best_semantic_prior",
+                "semantic_orphan",
+                "aef_best_compare_value",
+                "agreement",
             ]
         )
         for r in rows:
@@ -502,8 +607,49 @@ def save_matching_table_csv(
                     "" if np.isnan(r.entropy) else f"{r.entropy:.4f}",
                     str(r.reference_low_confidence),
                     "|".join(str(b) for b in r.compare_low_confidence),
+                    "" if r.best_semantic_value < 0 else r.best_semantic_value,
+                    r.best_semantic_name,
+                    "" if np.isnan(r.best_semantic_prior) else f"{r.best_semantic_prior:.4f}",
+                    str(r.semantic_orphan),
+                    "" if r.aef_best_compare_value < 0 else r.aef_best_compare_value,
+                    r.agreement,
                 ]
             )
+    return path
+
+
+def save_semantic_prior_csv(aff: AffinityResult, path: Path | None = None) -> Path:
+    """Write ``semantic_prior.csv`` -- the M x N directed prior pi.
+
+    The definition-level counterpart to ``raw_similarity.csv``: where that says
+    how alike two classes *look*, this says how well one's definition fits inside
+    the other's. Stage 8c reads the two together to separate spectral confusion
+    from definition drift.
+    """
+    path = path or (CONFIG.cache_dir / "semantic_prior.csv")
+    if aff.semantic_prior is None:
+        raise ValueError(
+            "affinity result carries no semantic prior; recompute with "
+            "compute_affinity(...) from Stage 8b or later"
+        )
+    _matrix_csv(path, aff.semantic_prior, aff)
+    return path
+
+
+def save_aef_affinity_csv(aff: AffinityResult, path: Path | None = None) -> Path:
+    """Write ``aef_affinity.csv`` -- the unfused (alpha = 0) probability rows.
+
+    Kept beside the fused ``normalized_affinity.csv`` so the effect of the prior
+    is auditable: the two files differ only where alpha moved a row, and at
+    alpha = 0 they are identical.
+    """
+    path = path or (CONFIG.cache_dir / "aef_affinity.csv")
+    if aff.normalized_affinity_aef is None:
+        raise ValueError(
+            "affinity result carries no unfused rows; recompute with "
+            "compute_affinity(...) from Stage 8b or later"
+        )
+    _matrix_csv(path, aff.normalized_affinity_aef, aff)
     return path
 
 
@@ -517,6 +663,7 @@ def compute_affinity_directed(
     compare_id: str,
     *,
     direction: str = "reference_to_compare",
+    alpha: float | None = None,
 ) -> AffinityResult:
     """Affinity for a chosen reading direction.
 
@@ -525,11 +672,17 @@ def compute_affinity_directed(
     affinity is *recomputed* with roles swapped rather than transposed, because
     row-normalisation and entropy are direction-specific (docs/PIPELINE.md,
     Stage 4 -> direction toggle).
+
+    The semantic prior needs no special handling here: swapping the ids makes
+    ``semantic_prior`` build the prior for the swapped ordered pair, and the
+    prior is directed (inclusion, source into target), so it comes out oriented
+    correctly for free. ``alpha`` is forwarded so a directed read can be fused
+    the same way the primary direction is.
     """
     if direction == "reference_to_compare":
-        return compute_affinity(reference_id, compare_id)
+        return compute_affinity(reference_id, compare_id, alpha=alpha)
     if direction == "compare_to_reference":
-        return compute_affinity(compare_id, reference_id)
+        return compute_affinity(compare_id, reference_id, alpha=alpha)
     raise ValueError(
         f"Unknown direction {direction!r}; expected 'reference_to_compare' or "
         "'compare_to_reference'."

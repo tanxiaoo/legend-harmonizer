@@ -321,6 +321,15 @@ class AffinityResult:
     distribution sharp enough for entropy to separate ``strong`` from ``mixed``.
     ``row_entropy`` is the per-row normalised mapping entropy of that softmax
     distribution in [0, 1]. ``distance`` keeps the underlying MW2 distances.
+
+    **Semantic prior (Stage 8b).** ``semantic_prior`` is the M x N directed prior
+    from ``harmonizer.semantics`` and ``alpha`` the exponent it enters the softmax
+    with; ``normalized_affinity`` is the **fused** result. ``normalized_affinity_aef``
+    keeps the unfused (alpha = 0) row-softmax so the Stage 8c disagreement report can
+    put observational and fused tables side by side without a second run.
+    ``semantic_orphan`` marks rows whose best prior falls below
+    ``semantic_orphan_floor`` -- reported alongside, never replacing, the
+    observational orphan status, which stays driven by the raw-similarity floor.
     """
 
     reference_id: str
@@ -329,10 +338,15 @@ class AffinityResult:
     compare_classes: list[int]
     distance: np.ndarray             # (M, N) MW2 distances
     raw_similarity: np.ndarray       # (M, N) s = 1/(1+d)
-    normalized_affinity: np.ndarray  # (M, N) row-normalised
+    normalized_affinity: np.ndarray  # (M, N) row-normalised (fused when alpha > 0)
     row_entropy: np.ndarray          # (M,) normalised entropy in [0, 1]
     reference_low_confidence: dict[int, bool] = field(default_factory=dict)
     compare_low_confidence: dict[int, bool] = field(default_factory=dict)
+    # -- Stage 8b: semantic prior ------------------------------------------- #
+    semantic_prior: np.ndarray | None = None       # (M, N) directed prior pi
+    alpha: float = 0.0                             # exponent on the prior
+    semantic_orphan: np.ndarray | None = None      # (M,) bool
+    normalized_affinity_aef: np.ndarray | None = None  # (M, N) the alpha = 0 rows
 
 
 def _normalised_entropy(prob_row: np.ndarray) -> float:
@@ -349,17 +363,34 @@ def _normalised_entropy(prob_row: np.ndarray) -> float:
     return ent / float(np.log(n))
 
 
-def _softmax_rows(distance: np.ndarray, temperature: float) -> np.ndarray:
+def _softmax_rows(
+    distance: np.ndarray,
+    temperature: float,
+    *,
+    prior: np.ndarray | None = None,
+    alpha: float = 0.0,
+) -> np.ndarray:
     """Per-row softmax over negative distances: ``exp(-d/T) / sum_k exp(-d/T)``.
 
     Replaces linear normalisation of the raw similarities, which flattened every
     row to near-uniform because ``s = 1/(1+d)`` compresses the distance range.
     The max is subtracted per row for numerical stability (it cancels in the
     ratio). ``temperature`` must be > 0; smaller sharpens the winner.
+
+    With a ``prior`` and ``alpha > 0`` the logits become the Stage 8 fused form
+    ``-d_ij / T + alpha * log pi_ij``: the semantic prior enters as a *power*
+    prior, so alpha scales how much a definition mismatch may move a row.
+    ``alpha = 0`` drops the term entirely and reproduces the observational
+    behaviour bit-for-bit, which is what makes the Stage 8b regression exact.
     """
     if temperature <= 0:
         raise ValueError(f"softmax temperature must be > 0, got {temperature!r}")
     logits = -distance / temperature
+    if prior is not None and alpha:
+        # Clip before the log: pi is in (0, 1] by construction, but a zero would
+        # send the logit to -inf and silently annihilate the row's other terms.
+        eps = CONFIG.affinity.semantic_prior_epsilon
+        logits = logits + alpha * np.log(np.clip(prior, eps, None))
     logits -= logits.max(axis=1, keepdims=True)
     exp = np.exp(logits)
     return exp / exp.sum(axis=1, keepdims=True)
@@ -370,6 +401,7 @@ def compute_affinity(
     compare_id: str,
     *,
     temperature: float | None = None,
+    alpha: float | None = None,
 ) -> AffinityResult:
     """Compute the raw and normalised affinity matrices for a map pair.
 
@@ -378,9 +410,17 @@ def compute_affinity(
     ``s = 1/(1+d)`` (the orphan-floor signal); ``normalized_affinity`` is the
     per-row softmax over negative distances with ``temperature`` (default
     ``CONFIG.affinity.softmax_temperature``).
+
+    ``alpha`` (default ``CONFIG.affinity.semantic_prior_alpha``) weights the
+    Stage 8 semantic prior in the fused logits ``-d/T + alpha * log pi``. At
+    ``alpha = 0`` the prior is computed and reported but does not affect
+    ``normalized_affinity``. The unfused rows are always kept in
+    ``normalized_affinity_aef`` for the disagreement report.
     """
     if temperature is None:
         temperature = CONFIG.affinity.softmax_temperature
+    if alpha is None:
+        alpha = CONFIG.affinity.semantic_prior_alpha
 
     ref = load_map_gmm(reference_id)
     cmp = load_map_gmm(compare_id)
@@ -396,12 +436,26 @@ def compute_affinity(
 
     raw_similarity = 1.0 / (1.0 + distance)
 
+    # Stage 8: the directed semantic prior over the same class ordering, so it
+    # aligns with `distance` cell for cell. An unencoded pair yields ones (and a
+    # warning), which leaves the fused logits identical to the unfused ones.
+    from harmonizer.semantics import semantic_prior as _semantic_prior
+    from harmonizer.semantics import semantic_orphans as _semantic_orphans
+
+    prior = _semantic_prior(reference_id, compare_id, ref_classes, cmp_classes)
+
     # Row probabilities: temperature-scaled softmax over negative distances (not a
-    # linear normalisation of raw similarities, which flattens the rows).
+    # linear normalisation of raw similarities, which flattens the rows), fused
+    # with the semantic prior when alpha > 0.
     if n == 0:
         normalized = np.zeros((m, 0), dtype=float)
+        normalized_aef = np.zeros((m, 0), dtype=float)
     else:
-        normalized = _softmax_rows(distance, temperature)
+        normalized = _softmax_rows(distance, temperature, prior=prior, alpha=alpha)
+        # The alpha = 0 rows, kept so the disagreement report needs no second run.
+        normalized_aef = (
+            normalized if not alpha else _softmax_rows(distance, temperature)
+        )
 
     row_entropy = np.array(
         [_normalised_entropy(normalized[i]) for i in range(m)], dtype=float
@@ -416,6 +470,10 @@ def compute_affinity(
         raw_similarity=raw_similarity,
         normalized_affinity=normalized,
         row_entropy=row_entropy,
+        semantic_prior=prior,
+        alpha=float(alpha),
+        semantic_orphan=_semantic_orphans(prior),
+        normalized_affinity_aef=normalized_aef,
         reference_low_confidence={
             cv: ref.classes[cv].low_confidence for cv in ref_classes
         },

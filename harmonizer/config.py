@@ -56,15 +56,52 @@ class MapsConfig:
     embedding_dims: int = 64
 
     # Google Cloud project that Earth Engine runs under. Required by ee.Initialize
-    # for current GEE accounts. Override via the EE_PROJECT environment variable
-    # if your project id differs.
-    gee_project: str = "legend-harmonization"
+    # for current GEE accounts, and it is a *permission* boundary, not a label:
+    # the authenticated account must hold serviceusage.services.use on it, or
+    # every GEE call fails with "Caller does not have required permission to use
+    # project <id>" -- which surfaces as a sampling failure, far from its cause.
+    # Override per machine via the EE_PROJECT environment variable rather than
+    # editing this, since the right project depends on which account is signed in.
+    gee_project: str = "ee-xiaoo-01-503707"
 
     # Working year 2021 for the test swap: WorldCover v200 is a 2021 product, so
     # the Dynamic World composite and AlphaEarth sampling match that year. This is
     # a run parameter (which year to sample), not a per-map fact.
     working_year: int = 2021
     target_crs: str = "EPSG:4326"
+
+
+# --------------------------------------------------------------------------- #
+# Tile serving
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class TilesConfig:
+    """Serving-side settings for local-raster label tiles.
+
+    These are *deployment* settings, not pipeline constants: they describe the
+    filesystem the rasters sit on, not what the pipeline computes.
+    """
+
+    # How many reads of the **original** rasters (the registry's ``access.path``,
+    # used only until ``tools/to_cog.py`` has converted a product) may run at
+    # once. 1 fully serialises them.
+    #
+    # This defaults to 4, which is right for a local disk. Deployments whose
+    # ``data/`` sits on a **network filesystem must set this back to 1**: on the
+    # Lustre mount this code was first written against, concurrent reads twice
+    # crashed the process with a SIGFPE inside libtiff (see the long note in
+    # ``local_tiles.py``). Serialising did not fix Lustre but removed concurrent
+    # access as a trigger. Override with ``HARMONIZER_SOURCE_CONCURRENCY=1``.
+    source_concurrency: int = int(
+        os.environ.get("HARMONIZER_SOURCE_CONCURRENCY", "4")
+    )
+
+    # How many reads of the converted COG tree may run at once. Those reads are
+    # ~1000x cheaper (overview pyramids), so allowing several in flight is what
+    # keeps two map panes refreshing without queueing behind each other.
+    cog_concurrency: int = int(os.environ.get("HARMONIZER_COG_CONCURRENCY", "4"))
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +190,73 @@ class AffinityConfig:
     # every genuine best match and above the weakest, non-matching rows).
     absolute_affinity_floor: float | None = 0.60  # (tune)
 
+    # -- Semantic prior (Stage 8; docs/PIPELINE.md section 2) ------------------ #
+    # Exponent alpha on the semantic prior pi in the fused logits
+    # ``-d_ij / T + alpha * log pi_ij``. 0 reproduces the AEF-only behaviour
+    # bit-for-bit; set after the Stage 8c sweep with T held fixed. (tune)
+    semantic_prior_alpha: float = 0.0
+    # Lower clip on each veto-attribute score (surface, cultivation, life form):
+    # a mismatch is a strong penalty, never an impossibility. (tune)
+    semantic_veto_floor: float = 0.10
+    # A row is flagged ``semantic_orphan`` when ``max_j pi_ij`` is below this.
+    # Reported alongside, never replacing, the observational orphan status. (tune)
+    semantic_orphan_floor: float = 0.30
+    # Lower clip on pi before the logarithm (numerical only).
+    semantic_prior_epsilon: float = 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# Semantic prior: categorical correspondence tables and interval caps (Stage 8)
+# --------------------------------------------------------------------------- #
+
+# Categorical likeness between two LCCS attribute values, from the FAO
+# correspondence table (FAO cb5130en, *Register implementation for land cover
+# legends*, Appendix B, Table 8-1; scores 1-10, divided by 10). Keyed by the
+# unordered pair of values; the same value on both sides always scores 1.0 and is
+# not tabulated. One table per categorical attribute; values in [0, 1].
+SEMANTIC_CORRESPONDENCE: dict[str, dict[frozenset[str], float]] = {
+    "life_form": {
+        frozenset({"tree", "shrub"}): 0.6,
+        frozenset({"tree", "herbaceous"}): 0.3,
+        frozenset({"shrub", "herbaceous"}): 0.4,
+        # "woody / lichen_moss 0.1" -- woody covers both tree and shrub.
+        frozenset({"tree", "lichen_moss"}): 0.1,
+        frozenset({"shrub", "lichen_moss"}): 0.1,
+        frozenset({"herbaceous", "lichen_moss"}): 0.4,
+    },
+    "surface": {
+        frozenset({"vegetated", "bare"}): 0.3,
+        frozenset({"water", "snow"}): 0.3,
+        # All other cross pairs 0.1 (listed in full so a lookup never guesses).
+        frozenset({"vegetated", "built"}): 0.1,
+        frozenset({"vegetated", "water"}): 0.1,
+        frozenset({"vegetated", "snow"}): 0.1,
+        frozenset({"built", "bare"}): 0.1,
+        frozenset({"built", "water"}): 0.1,
+        frozenset({"built", "snow"}): 0.1,
+        frozenset({"bare", "water"}): 0.1,
+        frozenset({"bare", "snow"}): 0.1,
+    },
+    "cultivation": {
+        frozenset({"natural", "cultivated"}): 0.3,
+    },
+    "leaf_type": {
+        frozenset({"broadleaf", "needleleaf"}): 0.3,
+    },
+    "phenology": {
+        frozenset({"evergreen", "deciduous"}): 0.3,
+    },
+}
+
+# Natural maximum of each interval attribute: an open-ended (``null``) upper
+# bound in a legend encoding is capped here before the inclusion is computed.
+# cover in % of the dominant life form, height in metres, flooding in months/year.
+SEMANTIC_INTERVAL_MAX: dict[str, float] = {
+    "cover": 100.0,
+    "height": 50.0,
+    "flooding": 12.0,
+}
+
 
 # --------------------------------------------------------------------------- #
 # Review (Stage 6 -- human-in-the-loop evidence explorer)
@@ -233,6 +337,7 @@ class AbsenceConfig:
 @dataclass(frozen=True)
 class Config:
     maps: MapsConfig = field(default_factory=MapsConfig)
+    tiles: TilesConfig = field(default_factory=TilesConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     buffering: BufferingConfig = field(default_factory=BufferingConfig)
     gmm: GMMConfig = field(default_factory=GMMConfig)

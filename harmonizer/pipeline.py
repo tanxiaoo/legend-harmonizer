@@ -37,9 +37,11 @@ from harmonizer.decision import (
     build_matching_table,
     classify_rows,
     raw_similarity_summary,
+    save_aef_affinity_csv,
     save_matching_table_csv,
     save_normalized_affinity_csv,
     save_raw_similarity_csv,
+    save_semantic_prior_csv,
 )
 from harmonizer.modeling import fit_map, gmm_cache_path, save_map_gmm
 from harmonizer.overlap import Overlap, overlap_for_products
@@ -70,6 +72,11 @@ class RunParams:
     n_components: int | None = None
     points_floor: int | None = None
     points_target: int | None = None
+    # Stage 8: exponent on the semantic prior in the fused softmax. None reads
+    # CONFIG.affinity.semantic_prior_alpha. It deliberately does NOT enter the
+    # run signature: alpha only affects Stage 4, which is recomputed on every
+    # run, so changing it must not invalidate the expensive Stage 2/3 cache.
+    alpha: float | None = None
     # When True, ignore any cached GMMs and re-sample from GEE even if the run
     # signature matches (see cache reuse below).
     force_refresh: bool = False
@@ -85,6 +92,9 @@ class RunResult:
     raw_similarity_csv: Path
     normalized_affinity_csv: Path
     matching_table_csv: Path
+    # Stage 8b: the semantic prior and the unfused (alpha = 0) probability rows.
+    semantic_prior_csv: Path | None = None
+    aef_affinity_csv: Path | None = None
     # Decorated matching rows and the raw-similarity summary, ready for the UI.
     matching_rows: list = field(default_factory=list)
     raw_summary: object = None
@@ -283,9 +293,28 @@ def run_sampling(
             report(1.0, "reusing cached points (same inputs); no GEE sampling")
         else:
             report(0.02, "overlap computed; sampling reference map points")
-            save_map_sample(sample_map(params.reference_id, overlap=overlap))
+            # Sub-progress per side, so a long local full-overlap scan (thousands
+            # of grid cells) advances visibly instead of sitting at 2% then 50%.
+            # Each side owns half the bar: reference 0.02-0.50, compare 0.50-1.00.
+            save_map_sample(
+                sample_map(
+                    params.reference_id,
+                    overlap=overlap,
+                    progress=lambda f, s: report(
+                        0.02 + 0.48 * f, f"reference: {s}"
+                    ),
+                )
+            )
             report(0.50, "sampling compare map points")
-            save_map_sample(sample_map(params.compare_id, overlap=overlap))
+            save_map_sample(
+                sample_map(
+                    params.compare_id,
+                    overlap=overlap,
+                    progress=lambda f, s: report(
+                        0.50 + 0.48 * f, f"compare: {s}"
+                    ),
+                )
+            )
             # A fresh sampling pass supersedes any GMMs fitted from older
             # points; drop them so nothing downstream mixes the two.
             gmm_cache_path(params.reference_id).unlink(missing_ok=True)
@@ -343,12 +372,23 @@ def run_pipeline(
             save_map_gmm(fit_map(params.compare_id))
         else:
             # Stage 2 - sample both label maps (the expensive, networked part).
+            # Per-cell sub-progress on the local path (see run_sampling): the
+            # sampling phase owns 0.02-0.35 for the reference and 0.35-0.70 for
+            # the compare map, with GMM fitting following from 0.70.
             report(0.02, "overlap computed; sampling reference map")
-            ref_sample = sample_map(params.reference_id, overlap=overlap)
+            ref_sample = sample_map(
+                params.reference_id,
+                overlap=overlap,
+                progress=lambda f, s: report(0.02 + 0.33 * f, f"reference: {s}"),
+            )
             save_map_sample(ref_sample)
 
             report(0.35, "sampling compare map")
-            cmp_sample = sample_map(params.compare_id, overlap=overlap)
+            cmp_sample = sample_map(
+                params.compare_id,
+                overlap=overlap,
+                progress=lambda f, s: report(0.35 + 0.33 * f, f"compare: {s}"),
+            )
             save_map_sample(cmp_sample)
 
             # Stage 3 - fit GMMs per class for both maps.
@@ -362,7 +402,9 @@ def run_pipeline(
 
         # Stage 4 - affinity, decision, matching table, CSVs.
         report(0.88, "computing affinity")
-        aff = compute_affinity(params.reference_id, params.compare_id)
+        aff = compute_affinity(
+            params.reference_id, params.compare_id, alpha=params.alpha
+        )
         decisions, _ = classify_rows(aff)
         # Stage 7a: absent classes come from the declared registry legend (both
         # sides), so a class with no pixels in the AOI is reported rather than
@@ -374,6 +416,10 @@ def run_pipeline(
         raw_path = save_raw_similarity_csv(aff)
         norm_path = save_normalized_affinity_csv(aff)
         table_path = save_matching_table_csv(rows)
+        # Stage 8b: the prior and the unfused rows, so the effect of alpha is
+        # auditable from the cache without recomputing.
+        semantic_path = save_semantic_prior_csv(aff)
+        aef_path = save_aef_affinity_csv(aff)
 
         report(1.0, "done")
         return RunResult(
@@ -383,6 +429,8 @@ def run_pipeline(
             raw_similarity_csv=raw_path,
             normalized_affinity_csv=norm_path,
             matching_table_csv=table_path,
+            semantic_prior_csv=semantic_path,
+            aef_affinity_csv=aef_path,
             matching_rows=rows,
             raw_summary=raw_similarity_summary(aff),
             reused_cache=reused,

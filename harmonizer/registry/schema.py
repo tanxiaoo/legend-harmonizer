@@ -35,6 +35,123 @@ Footprint = tuple[float, float, float, float] | None
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Semantic attributes (Stage 8a)
+# --------------------------------------------------------------------------- #
+
+# Allowed values per categorical attribute. ``any`` (or an omitted key) means
+# *unspecified*, which scores 1.0 against anything -- the legend simply does not
+# constrain that attribute. Anything else raises at load time, so a typo in a
+# YAML encoding is caught when the registry loads rather than silently becoming
+# an unmatchable value.
+SEMANTIC_ENUMS: dict[str, frozenset[str]] = {
+    "surface": frozenset({"vegetated", "built", "bare", "water", "snow"}),
+    "cultivation": frozenset({"natural", "cultivated"}),
+    "life_form": frozenset({"tree", "shrub", "herbaceous", "lichen_moss"}),
+    "leaf_type": frozenset({"broadleaf", "needleleaf"}),
+    "phenology": frozenset({"evergreen", "deciduous"}),
+}
+
+#: Interval-valued attributes, as ``[low, high]`` with ``null`` allowed on either
+#: bound for open-ended. Their natural maxima live in ``config.py``.
+SEMANTIC_INTERVALS: tuple[str, ...] = ("cover", "height", "flooding")
+
+#: An interval bound pair; ``None`` on a side means open-ended there.
+Interval = tuple[float | None, float | None]
+
+
+@dataclass(frozen=True)
+class SemanticAlternative:
+    """One OR-branch of a class's LCCS attribute encoding.
+
+    A legend class that means "either A or B" (WorldCover Cropland is dry *or*
+    aquatic; HRLC 90 is tree *or* shrub) carries one alternative per branch. A
+    single-meaning class carries exactly one.
+
+    Categorical attributes are ``None`` when unspecified (written ``any`` or
+    omitted in the YAML); interval attributes are ``None`` when unspecified and
+    otherwise a ``(low, high)`` pair whose bounds may individually be ``None``
+    for open-ended. Unspecified always scores 1.0 -- it is "no constraint", not
+    "no match".
+    """
+
+    surface: str | None = None
+    cultivation: str | None = None
+    life_form: str | None = None
+    leaf_type: str | None = None
+    phenology: str | None = None
+    cover: Interval | None = None
+    height: Interval | None = None
+    flooding: Interval | None = None
+
+
+@dataclass(frozen=True)
+class ClassSemantics:
+    """A legend class's LCCS attribute encoding: one or more alternatives."""
+
+    alternatives: tuple[SemanticAlternative, ...]
+
+
+def _norm_enum(attr: str, raw, where: str) -> str | None:
+    """Validate a categorical attribute value; ``any``/missing -> None."""
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if value == "any":
+        return None
+    allowed = SEMANTIC_ENUMS[attr]
+    if value not in allowed:
+        raise ValueError(
+            f"{where}: unknown {attr} value {raw!r}; "
+            f"expected one of {sorted(allowed)} or 'any'"
+        )
+    return value
+
+
+def _norm_interval(attr: str, raw, where: str) -> Interval | None:
+    """Validate an interval attribute; missing -> None (unspecified)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        raise ValueError(
+            f"{where}: {attr} must be a [low, high] pair (null allowed on a "
+            f"bound), got {raw!r}"
+        )
+    low, high = (None if b is None else float(b) for b in raw)
+    if low is not None and high is not None and low > high:
+        raise ValueError(f"{where}: {attr} interval is inverted: {raw!r}")
+    return (low, high)
+
+
+def _parse_semantics(raw, where: str) -> ClassSemantics | None:
+    """Parse a class's optional ``semantics`` block (docs/PIPELINE.md, 8a.1)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: semantics must be a mapping, got {type(raw).__name__}")
+    raw_alts = raw.get("alternatives")
+    if not raw_alts:
+        raise ValueError(f"{where}: semantics needs a non-empty 'alternatives' list")
+
+    alts: list[SemanticAlternative] = []
+    for n, entry in enumerate(raw_alts):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where}: alternative {n} is not a mapping")
+        unknown = set(entry) - set(SEMANTIC_ENUMS) - set(SEMANTIC_INTERVALS)
+        if unknown:
+            raise ValueError(
+                f"{where}: alternative {n} has unknown attribute(s) {sorted(unknown)}"
+            )
+        loc = f"{where} alternative {n}"
+        alts.append(
+            SemanticAlternative(
+                **{a: _norm_enum(a, entry.get(a), loc) for a in SEMANTIC_ENUMS},
+                **{a: _norm_interval(a, entry.get(a), loc) for a in SEMANTIC_INTERVALS},
+            )
+        )
+    return ClassSemantics(alternatives=tuple(alts))
+
+
 @dataclass(frozen=True)
 class LegendClass:
     """One class in a map's legend.
@@ -42,6 +159,15 @@ class LegendClass:
     ``code`` is the raw integer class value in the raster / label band. ``name``
     and ``color`` (a ``#RRGGBB`` hex string) are the map's published legend.
     ``description`` and ``shared_scheme`` are optional.
+
+    ``observed`` records whether the class was actually **found in this
+    dataset's pixels** when it was indexed (DESIGN.md 4.3). A class declared by
+    the published legend but absent from the data is legitimate -- a regional
+    subset simply does not contain every class of a global legend -- so it is
+    kept in the legend and marked instead of dropped, which lets the UI grey it
+    out and say why. ``None`` means "not determined", which is the honest answer
+    for a GEE product or a hand-written entry that predates the check; only
+    ``False`` asserts absence.
     """
 
     code: int
@@ -49,6 +175,10 @@ class LegendClass:
     color: str
     description: str | None = None
     shared_scheme: str | None = None
+    observed: bool | None = None
+    #: Optional LCCS attribute encoding driving the Stage 8 semantic prior. None
+    #: where the legend has not been encoded; such a product gets a uniform prior.
+    semantics: ClassSemantics | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +228,17 @@ class ProductSpec:
     def class_codes(self) -> list[int]:
         return [c.code for c in self.legend]
 
+    @property
+    def has_semantics(self) -> bool:
+        """True when **every** legend class carries an attribute encoding.
+
+        The Stage 8 prior is only meaningful if the whole legend is encoded: a
+        partially encoded product would silently mix real inclusion scores with
+        uniform 1.0 rows, which reads as "everything matches this class". So a
+        product is either fully encoded or treated as unencoded.
+        """
+        return bool(self.legend) and all(c.semantics is not None for c in self.legend)
+
     def class_name(self, code: int) -> str:
         """Readable name for a class code, or the code itself if not in the legend."""
         entry = self.legend_by_code.get(int(code))
@@ -133,18 +274,26 @@ def _norm_color(raw: str | None) -> str:
     return s.lower()
 
 
-def _parse_legend(raw_legend) -> tuple[LegendClass, ...]:
+def _parse_legend(raw_legend, product_id: str = "?") -> tuple[LegendClass, ...]:
     if not raw_legend:
         return ()
     out: list[LegendClass] = []
     for entry in raw_legend:
+        code = int(entry["code"])
         out.append(
             LegendClass(
-                code=int(entry["code"]),
+                code=code,
                 name=str(entry["name"]),
                 color=_norm_color(entry.get("color")),
                 description=entry.get("description"),
                 shared_scheme=entry.get("shared_scheme"),
+                # Absent key -> None ("not determined"), never False: only an
+                # explicit `observed: false` from the indexer asserts that the
+                # class is missing from this dataset's pixels.
+                observed=entry.get("observed"),
+                semantics=_parse_semantics(
+                    entry.get("semantics"), f"{product_id} class {code}"
+                ),
             )
         )
     return tuple(out)
@@ -177,7 +326,7 @@ def parse_product(doc: dict, source_path: Path | None = None) -> ProductSpec:
         footprint=_norm_footprint(doc.get("footprint")),
         licence=doc.get("licence"),
         citation=doc.get("citation"),
-        legend=_parse_legend(doc.get("legend")),
+        legend=_parse_legend(doc.get("legend"), str(doc.get("id", "?"))),
         embedding_dims=(
             int(doc["embedding_dims"]) if doc.get("embedding_dims") is not None else None
         ),
