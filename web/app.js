@@ -158,22 +158,223 @@ async function init() {
     `affinity floor=${c.absolute_affinity_floor ?? "None (uncalibrated)"}, ` +
     `margin threshold=${c.margin_threshold}.`;
 
+  // Stage 8d: anchor the alpha slider on the calibrated config value. ALPHA
+  // stays null so a session that never touches the slider follows config.
+  ALPHA_DEFAULT = c.semantic_prior_alpha ?? 1;
+  wireAlpha();
+
   // Stand up the split map, then load the two selected label maps onto it.
   setupMaps();
   await refreshMapSide("ref");
   await refreshMapSide("cmp");
   await refreshFootprints();
+
+  // A dataset dropped into data/ registers itself on server startup; watch it
+  // through to selectable without the user reloading the page (DESIGN.md 4.1).
+  pollDatasetsUntilReady();
+
+  // ...and say so on load when a dataset is waiting for something from the user.
+  // A greyed row in a dropdown is not a prompt: the folder is there, the app has
+  // noticed it, and it is blocked on one file the user has to supply -- that has
+  // to be stated, not left to be discovered by opening the picker.
+  await announceBlockedDatasets();
 }
 
-function fillSelect(sel, products) {
-  sel.innerHTML = "";
-  for (const p of products) {
-    const opt = document.createElement("option");
-    opt.value = p.id;
-    const tag = p.source === "local_raster" ? "local" : "GEE";
-    opt.textContent = `[${tag}] ${p.name}`;
-    sel.appendChild(opt);
+// Tell the user, unprompted, about datasets that cannot proceed without them.
+// Only ever states a fact and what to do about it; it never modifies data/.
+async function announceBlockedDatasets() {
+  let data;
+  try {
+    data = await getJSON("/api/datasets");
+  } catch (_) {
+    return;
   }
+  const blocked = (data.datasets || []).filter(
+    (d) => d.state === "needs-legend" || d.state === "error"
+  );
+  if (!blocked.length) return;
+
+  const status = $("map-status");
+  status.className = "note warn";
+  const names = blocked.map((d) => `“${d.folder}”`).join(", ");
+  status.textContent =
+    blocked.length === 1
+      ? `${names} needs a legend before it can be used — see the panel below.`
+      : `${blocked.length} datasets need attention: ${names} — see the panel below.`;
+
+  // The detail (exact path, required columns, the layout rule) goes in the
+  // info panel, which has room for it.
+  const needLegend = blocked.filter((d) => d.state === "needs-legend");
+  if (needLegend.length) {
+    await showDropInRules(needLegend);
+  } else {
+    const info = $("overlap-info");
+    info.className = "info error";
+    info.style.whiteSpace = "pre-wrap";
+    info.textContent = blocked
+      .map((d) => `${d.folder}: ${d.detail}`)
+      .join("\n\n");
+  }
+}
+
+// "Refresh datasets": rescan data/ and start registering anything new. The
+// counterpart of dropping a folder in while the server is already running.
+async function refreshDatasets() {
+  const status = $("map-status");
+  status.className = "note";
+  status.textContent = "Rescanning data/ …";
+  try {
+    const r = await getJSON("/api/datasets/refresh", { method: "POST" });
+    const started = r.started || [];
+    const pending = (r.datasets || []).filter((d) => d.state === "needs-legend");
+
+    // A dataset folder that has been deleted leaves its derived files behind
+    // (a converted COG tree is often several GB). Offer to remove them, but
+    // only ever on an explicit confirmation — a rescan silently deleting
+    // gigabytes is exactly the surprise this flow exists to avoid.
+    const missing = (r.datasets || []).filter((d) => d.state === "missing");
+    if (missing.length) {
+      await offerCleanup(missing);
+      return;
+    }
+
+    if (started.length) {
+      status.textContent = `Registering ${started.length} dataset(s): ${started
+        .map((j) => j.folder)
+        .join(", ")}`;
+      pollDatasetsUntilReady();
+    } else if (pending.length) {
+      status.className = "note warn";
+      status.textContent =
+        `Nothing to register. ${pending.length} dataset(s) still need a legend CSV: ` +
+        pending.map((d) => d.folder).join(", ");
+      // Teach the convention at the point of failure — the rules come from the
+      // server so this text cannot drift from the code that enforces them.
+      showDropInRules(pending);
+    } else {
+      status.textContent = "All datasets are up to date.";
+    }
+  } catch (e) {
+    status.className = "note error";
+    status.textContent = "Could not refresh datasets: " + e.message;
+  }
+}
+
+// Ready states a local product can be in (DESIGN.md 4.2). Only "ready" is
+// selectable; the rest are shown, disabled, with the reason — a product that is
+// still indexing must not silently vanish from the picker, or the user cannot
+// tell "not supported" from "not finished yet".
+const STATE_LABEL = {
+  ready: "",
+  indexing: "indexing…",
+  converting: "converting…",
+  "needs-legend": "needs legend",
+  "needs-conversion": "needs conversion",
+  error: "error",
+  missing: "data folder deleted",
+};
+
+// Grouped picker: local datasets first (this is a local-first app), then GEE.
+// Everything shown comes from /api/products — no product knowledge is hardcoded
+// here, per PIPELINE.md 2.5.
+function fillSelect(sel, products) {
+  const previous = sel.value;
+  sel.innerHTML = "";
+
+  const groups = [
+    ["Local datasets", products.filter((p) => p.source === "local_raster")],
+    ["GEE datasets", products.filter((p) => p.source !== "local_raster")],
+  ];
+
+  for (const [label, items] of groups) {
+    if (!items.length) continue;
+    const group = document.createElement("optgroup");
+    group.label = label;
+    for (const p of items) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+
+      // Facts that help tell two similar maps apart, from the registry. Kept
+      // SHORT: this text also renders in the closed selector, which is a narrow
+      // floating control over the map. Dynamic World declares ten available
+      // years — spelling them all out pushed its row past 100 characters and
+      // truncated every name with an ellipsis.
+      const bits = [];
+      const years = p.years || [];
+      if (years.length === 1) bits.push(String(years[0]));
+      else if (years.length > 1) bits.push(`${years[0]}–${years[years.length - 1]}`);
+      if (p.resolution_m) bits.push(`${Math.round(p.resolution_m)} m`);
+      const meta = bits.length ? ` · ${bits.join(", ")}` : "";
+
+      const state = p.state || "ready";
+      const badge = STATE_LABEL[state] ? `  [${STATE_LABEL[state]}]` : "";
+      opt.textContent = `${p.name}${meta}${badge}`;
+      // The full detail lives in the tooltip, where length costs nothing.
+      opt.title = years.length
+        ? `${p.name} — years: ${years.join(", ")}`
+        : p.name;
+
+      if (state !== "ready") {
+        opt.disabled = true;
+        opt.title = p.state_detail || STATE_LABEL[state] || state;
+      }
+      group.appendChild(opt);
+    }
+    sel.appendChild(group);
+  }
+
+  // Keep the current selection across refreshes, but never land on a product
+  // that is no longer selectable.
+  const stillValid = [...sel.options].some(
+    (o) => o.value === previous && !o.disabled
+  );
+  if (stillValid) sel.value = previous;
+  else {
+    const first = [...sel.options].find((o) => !o.disabled);
+    if (first) sel.value = first.value;
+  }
+}
+
+// Poll /api/products while any local dataset is still registering, so a product
+// that starts as "indexing…" becomes selectable on its own. Stops as soon as
+// nothing is in flight — this is a startup-time activity, not a heartbeat.
+let DATASET_POLL = null;
+
+async function pollDatasetsUntilReady() {
+  if (DATASET_POLL) return;
+  const tick = async () => {
+    try {
+      const { datasets, active } = await getJSON("/api/datasets");
+      const busy = datasets.filter(
+        (d) => d.state === "indexing" || d.state === "converting"
+      );
+      const status = $("map-status");
+      if (busy.length) {
+        const one = busy[0];
+        status.className = "note";
+        status.textContent =
+          `Preparing ${busy.length} dataset${busy.length > 1 ? "s" : ""}: ` +
+          `${one.folder} ${STATE_LABEL[one.state]} ` +
+          `${Math.round((one.progress || 0) * 100)}%`;
+      }
+      // Re-fill the dropdowns so newly-ready products become selectable.
+      const data = await getJSON("/api/products");
+      const labels = data.products.filter((p) => p.kind === "label");
+      fillSelect($("reference"), labels);
+      fillSelect($("compare"), labels);
+
+      if (!active && !busy.length) {
+        clearInterval(DATASET_POLL);
+        DATASET_POLL = null;
+        if (status.textContent.startsWith("Preparing ")) status.textContent = "";
+      }
+    } catch (_) {
+      clearInterval(DATASET_POLL);
+      DATASET_POLL = null;
+    }
+  };
+  DATASET_POLL = setInterval(tick, 3000);
+  tick();
 }
 
 // --- Split map: setup, tiles, toggles, footprints, AOI draw ----------------
@@ -269,7 +470,12 @@ async function refreshMapSide(side) {
     return;
   }
   LEGENDS[side] = legend;
-  VISIBLE[side] = new Set(legend.map((c) => c.value));
+  // Classes the data does not contain are never "visible": they have no pixels
+  // to paint, and their chips are non-toggleable, so including them would leave
+  // a class in the visible set with no way to remove it.
+  VISIBLE[side] = new Set(
+    legend.filter((c) => c.observed !== false).map((c) => c.value)
+  );
   renderLegend(side);
   await loadTiles(side);
 }
@@ -287,10 +493,22 @@ function renderLegend(side) {
   const legendEl = $(side === "ref" ? "legend-ref" : "legend-cmp");
   legendEl.innerHTML = "";
   for (const c of LEGENDS[side]) {
+    // `observed === false` means the indexer scanned this dataset's pixels and
+    // did not find the class (DESIGN.md 4.3). It stays in the legend — a
+    // regional subset legitimately lacks classes of a global legend — but it is
+    // greyed and non-toggleable, because there is nothing to show or hide.
+    // `undefined`/`null` means "not determined" (GEE products, hand-written
+    // entries), which must behave exactly as before.
+    const absent = c.observed === false;
     const on = VISIBLE[side].has(c.value);
     const chip = document.createElement("div");
-    chip.className = "legend-chip" + (on ? "" : " off");
-    chip.title = c.description
+    chip.className =
+      "legend-chip" + (absent ? " absent" : on ? "" : " off");
+    chip.title = absent
+      ? `Not present in this dataset — declared by the legend, but no pixels of this class were found when it was indexed.${
+          c.description ? "\n\n" + c.description : ""
+        }`
+      : c.description
       ? c.description
       : "Click: show only this class · Ctrl/Cmd+click: add/remove";
     const sw = document.createElement("span");
@@ -300,7 +518,11 @@ function renderLegend(side) {
     txt.textContent = `${c.name} (${c.value})`;
     chip.appendChild(sw);
     chip.appendChild(txt);
-    chip.addEventListener("click", (e) => selectClass(side, c.value, e.ctrlKey || e.metaKey));
+    if (!absent) {
+      chip.addEventListener("click", (e) =>
+        selectClass(side, c.value, e.ctrlKey || e.metaKey)
+      );
+    }
     legendEl.appendChild(chip);
   }
 }
@@ -315,7 +537,157 @@ function selectClass(side, value, additive) {
     VISIBLE[side] = new Set([value]);
   }
   renderLegend(side); // re-tint the chips
-  loadTiles(side);
+  // Class-code layers recolour the tiles they already hold — no network at all.
+  // Only the server-coloured fallback has to re-fetch.
+  const layer = LABEL_LAYERS[side];
+  if (layer && layer.recolor) layer.recolor(VISIBLE[side]);
+  else loadTiles(side);
+}
+
+// --- Class-code tile layer ---------------------------------------------------
+// The local-raster tile endpoint serves ONE tile per position encoding each
+// pixel's raw class code (greyscale) plus alpha for nodata — no palette, no
+// class subset (DESIGN.md 2.3). This layer decodes that tile into a canvas and
+// applies the legend palette itself, which is what makes toggling classes free:
+// `recolor()` re-runs a per-tile canvas pass over tiles already in memory, with
+// no request, no re-render, and no cache churn. One fetched tile therefore
+// serves every toggle state.
+//
+// Colours come from the legend the server already sent, so the palette is still
+// registry-driven (PIPELINE.md 2.5) — nothing about the classes is hardcoded here.
+const ClassCodeLayer = L.GridLayer.extend({
+  // opts: { template, palette: Map(code -> [r,g,b]), visible: Set(code) }
+  initialize: function (opts) {
+    L.GridLayer.prototype.initialize.call(this, opts);
+    this._palette = opts.palette;
+    this._visible = opts.visible;
+    // Decoded codes/alpha per tile key, kept so recolouring needs no re-decode
+    // and no re-fetch. Dropped in `tileunload` with Leaflet's own tile eviction,
+    // so this cannot grow without bound as the user pans.
+    this._decoded = new Map();
+    this.on("tileunload", (e) => {
+      this._decoded.delete(this._tileKey(e.coords));
+    });
+  },
+
+  _tileKey: function (c) {
+    return `${c.z}/${c.x}/${c.y}`;
+  },
+
+  createTile: function (coords, done) {
+    const size = this.getTileSize();
+    const canvas = L.DomUtil.create("canvas", "leaflet-tile");
+    canvas.width = size.x;
+    canvas.height = size.y;
+    const key = this._tileKey(coords);
+
+    const url = L.Util.template(this.options.template, {
+      z: coords.z,
+      x: coords.x,
+      y: coords.y,
+    });
+
+    const img = new Image();
+    // Same-origin, but the canvas must stay untainted for getImageData().
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      try {
+        // Read the codes back out of the PNG. The tile is lossless 8-bit
+        // greyscale+alpha, so the values here are the class codes verbatim —
+        // this is why the encoding must never scale or offset them.
+        const off = document.createElement("canvas");
+        off.width = size.x;
+        off.height = size.y;
+        const octx = off.getContext("2d", { willReadFrequently: true });
+        octx.drawImage(img, 0, 0);
+        const raw = octx.getImageData(0, 0, size.x, size.y).data;
+        // Greyscale unpacks to r=g=b=code; alpha rides in the 4th byte.
+        const n = size.x * size.y;
+        const codes = new Uint8Array(n);
+        const alpha = new Uint8Array(n);
+        for (let i = 0; i < n; i++) {
+          codes[i] = raw[i * 4];
+          alpha[i] = raw[i * 4 + 3];
+        }
+        this._decoded.set(key, { codes, alpha });
+        this._paint(canvas, codes, alpha);
+        done(null, canvas);
+      } catch (err) {
+        done(err, canvas);
+      }
+    };
+    img.onerror = () => {
+      // A tile outside the product's footprint 404s. That is ordinary — leave
+      // the canvas blank rather than reporting a layer error.
+      this._decoded.delete(key);
+      done(null, canvas);
+    };
+    img.src = url;
+    return canvas;
+  },
+
+  // Paint decoded codes through the palette. Hidden classes, unknown codes and
+  // nodata all become fully transparent so the basemap shows through.
+  _paint: function (canvas, codes, alpha) {
+    const ctx = canvas.getContext("2d");
+    const out = ctx.createImageData(canvas.width, canvas.height);
+    const d = out.data;
+    // Flat lookup tables beat a Map hit per pixel: 65k pixels a tile, and this
+    // runs for every visible tile on every toggle.
+    const lut = this._lut();
+    for (let i = 0; i < codes.length; i++) {
+      const c = codes[i] * 4;
+      const visible = alpha[i] !== 0 && lut[c + 3] !== 0;
+      const j = i * 4;
+      if (visible) {
+        d[j] = lut[c];
+        d[j + 1] = lut[c + 1];
+        d[j + 2] = lut[c + 2];
+        d[j + 3] = 255;
+      } else {
+        d[j + 3] = 0;
+      }
+    }
+    ctx.putImageData(out, 0, 0);
+  },
+
+  // 256-entry RGBA lookup, rebuilt only when the visible set changes.
+  _lut: function () {
+    if (this._lutCache) return this._lutCache;
+    const lut = new Uint8ClampedArray(256 * 4);
+    for (const [code, rgb] of this._palette) {
+      if (code < 0 || code > 255) continue; // not encodable in an 8-bit tile
+      if (!this._visible.has(code)) continue;
+      const o = code * 4;
+      lut[o] = rgb[0];
+      lut[o + 1] = rgb[1];
+      lut[o + 2] = rgb[2];
+      lut[o + 3] = 255; // marks "this code is painted"
+    }
+    this._lutCache = lut;
+    return lut;
+  },
+
+  // Re-colour every tile in place for a new visible set. No network.
+  recolor: function (visible) {
+    this._visible = visible;
+    this._lutCache = null;
+    for (const key of Object.keys(this._tiles)) {
+      const tile = this._tiles[key];
+      const decoded = this._decoded.get(this._tileKey(tile.coords));
+      if (decoded) this._paint(tile.el, decoded.codes, decoded.alpha);
+    }
+  },
+});
+
+// "RRGGBB" → [r,g,b]
+function hexToRgb(hex) {
+  const h = String(hex).replace("#", "");
+  return [
+    parseInt(h.slice(0, 2), 16),
+    parseInt(h.slice(2, 4), 16),
+    parseInt(h.slice(4, 6), 16),
+  ];
 }
 
 // Fetch the XYZ tile template for the visible subset and swap the layer in.
@@ -327,40 +699,113 @@ async function loadTiles(side) {
   const qs = values.length ? `?classes=${values.join(",")}` : "?classes=";
   status.textContent = `Loading ${productName(pid)} tiles…`;
   try {
-    const { template, max_native_zoom: maxNativeZoom } = await getJSON(
-      `/api/tiles/${pid}${qs}`
-    );
+    const {
+      template,
+      max_native_zoom: maxNativeZoom,
+      bounds,
+      encoding,
+    } = await getJSON(`/api/tiles/${pid}${qs}`);
 
     // Add the new layer *before* removing the old one and only drop the old one
     // once the new tiles have actually arrived. Removing first left the map
     // blank for the whole fetch, which is what made switching maps feel slow
     // even when the tiles themselves were quick.
     const previous = LABEL_LAYERS[side];
-    const layer = L.tileLayer(template, {
+    const common = {
       opacity: 0.85,
       // Keep a ring of off-screen tiles so a small pan re-uses them instead of
-      // re-requesting, and hold already-drawn tiles while new ones load.
-      keepBuffer: 4,
-      updateWhenIdle: false,
+      // re-requesting, and hold already-drawn tiles while new ones load. Kept
+      // deliberately small: eager prefetching pays off only against a fast
+      // backend, and while a tile can cost seconds it is actively harmful — a
+      // drag queues dozens of requests for viewports the user has already left,
+      // and the tiles they *are* looking at wait behind them. Worth revisiting
+      // upwards once every product is COG-converted.
+      keepBuffer: 2,
+      updateWhenIdle: true,
       updateWhenZooming: false,
       // Past the data's real resolution the browser upscales tiles it already
       // has rather than requesting finer ones the raster cannot fill. The cap
       // comes from the product's own metadata, not a fixed number, because
       // these products differ in ground resolution.
       ...(maxNativeZoom != null ? { maxNativeZoom, maxZoom: 22 } : {}),
+      // Confine requests to the product's own footprint. A regional map cannot
+      // serve a tile outside its extent, and Leaflet would otherwise request
+      // the whole viewport and collect a 404 for each one — correct behaviour
+      // on the server, but hundreds of console errors that hide real problems.
+      // [minLon, minLat, maxLon, maxLat] → Leaflet's [[south, west], [north, east]].
+      ...(bounds
+        ? { bounds: L.latLngBounds([bounds[1], bounds[0]], [bounds[3], bounds[2]]) }
+        : {}),
       className: "label-layer",
-    });
+    };
 
+    // Local-raster products serve class codes and are coloured here, so a class
+    // toggle never reaches the network (see ClassCodeLayer). GEE products stream
+    // ready-coloured tiles straight from Earth Engine, where the subset is baked
+    // in server-side and a toggle still means a new template.
+    let layer;
+    if (encoding === "class_code") {
+      const palette = new Map(
+        (LEGENDS[side] || []).map((c) => [c.value, hexToRgb(c.color)])
+      );
+      layer = new ClassCodeLayer({
+        ...common,
+        template,
+        palette,
+        visible: VISIBLE[side],
+      });
+    } else {
+      layer = L.tileLayer(template, common);
+    }
+
+    let swapped = false;
     const dropPrevious = () => {
+      if (swapped) return;
+      swapped = true;
       if (previous && map.hasLayer(previous)) map.removeLayer(previous);
       status.textContent = "";
     };
+    // Swap on 'load' (every visible tile has arrived). 'load' does not fire when
+    // Leaflet serves the whole viewport from its own cache, so 'tileload' is a
+    // second trigger: once any tile of the new layer has actually painted, the
+    // old one is safe to remove.
+    //
+    // Deliberately NOT a bare timeout. Dropping the previous layer after a fixed
+    // delay regardless of whether the new tiles had arrived is what made the map
+    // "sometimes show, sometimes not": on a slow first render the old layer went
+    // away and nothing had replaced it yet.
     layer.on("load", dropPrevious);
-    // 'load' does not fire when every tile is served from cache, so guarantee
-    // the swap completes either way.
-    setTimeout(dropPrevious, 2000);
+    layer.once("tileload", dropPrevious);
+    // Panned entirely outside this product's extent: every tile errors, so
+    // neither event above fires. Still clear the status, or it reads "Loading…"
+    // forever over a view the product simply does not cover.
+    layer.on("tileerror", () => {
+      status.textContent = "";
+    });
 
     LABEL_LAYERS[side] = layer.addTo(map);
+
+    // The current view may lie entirely OUTSIDE the new product's footprint --
+    // switching from an Africa map to a Southeast Asia one, say. Leaflet's
+    // `bounds` option then creates **no tiles at all**, so neither 'load' nor
+    // 'tileload' nor 'tileerror' ever fires and the swap above would never run:
+    // the previous product's tiles stayed on screen until the user zoomed out
+    // far enough to intersect the new footprint, which looked like "the map does
+    // not update when I change product".
+    //
+    // Retiring the old layer is not enough on its own -- that just leaves an
+    // empty pane. `refreshFootprints()` re-fits BOTH maps to both products'
+    // footprints after every product change, so the new data comes into view by
+    // itself; this only has to make sure the stale tiles are gone by then.
+    const settleIfEmpty = () => {
+      if (swapped) return;
+      if (Object.keys(layer._tiles || {}).length === 0) dropPrevious();
+    };
+    // After the current frame, so Leaflet has run its first _update() pass.
+    // One check is enough: this only decides whether to retire the PREVIOUS
+    // layer, and by this point Leaflet has already created whatever tiles the
+    // current view calls for. Later pans are the new layer's own business.
+    setTimeout(settleIfEmpty, 0);
   } catch (e) {
     status.className = "note error";
     status.textContent = `Could not load ${productName(pid)} tiles: ${e.message}`;
@@ -380,6 +825,15 @@ async function refreshFootprints() {
   try {
     data = await getJSON(`/api/footprints?${p.toString()}`);
   } catch (e) {
+    // Returning silently here used to hide a real failure: for a pair with no
+    // common ground (an Africa map beside a Southeast Asia one) the endpoint
+    // answered 400, so no footprints were drawn AND the view was never re-fitted
+    // — leaving whatever the previous product had painted on screen. The
+    // endpoint now reports an empty overlap as data, so reaching this branch
+    // means something actually went wrong and should be said out loud.
+    const status = $("map-status");
+    status.className = "note error";
+    status.textContent = `Could not load footprints: ${e.message}`;
     return;
   }
   OVERLAY_GROUP.ref.clearLayers();
@@ -404,7 +858,13 @@ async function refreshFootprints() {
     addBoth(data.overlap.geometry,
       { color: "#2f855a", weight: 3, fillColor: "#2f855a", fillOpacity: 0.1 }, "overlap");
   }
-  // Fit both maps to whatever we could draw (footprint / overlap / AOI).
+
+  // Fit both maps to everything we drew (both footprints / overlap / AOI). This
+  // is what makes a product change *visible*: the two maps may be on opposite
+  // sides of the world (Africa 9–45°E vs Southeast Asia 88–144°E), and without a
+  // re-fit the pane you just changed shows empty space — or, worse, still shows
+  // the previous product's tiles. Zooming out to contain both footprints puts
+  // the new data on screen immediately.
   let fit = null;
   for (const b of bounds) fit = fit ? fit.extend(b) : L.latLngBounds(b.getSouthWest(), b.getNorthEast());
   if (DRAW_LAYER) fit = (fit || DRAW_LAYER.ref.getBounds()).extend(DRAW_LAYER.ref.getBounds());
@@ -413,6 +873,17 @@ async function refreshFootprints() {
     MAPS.ref.fitBounds(fit.pad(0.15));
     MAPS.cmp.fitBounds(fit.pad(0.15));
     SYNCING = false;
+  }
+
+  // Say so when the pair has no common ground: the two boxes are now both
+  // visible, but there is nothing to run, and the reason should not have to be
+  // inferred from the picture.
+  if (data.overlap_error) {
+    const status = $("map-status");
+    status.className = "note warn";
+    status.textContent =
+      `These two maps do not overlap — ${data.overlap_error}. ` +
+      `Both footprints are outlined; pick a pair that shares ground to run.`;
   }
 }
 
@@ -445,6 +916,26 @@ function cardLabel(card) {
 
 // --- Overlap check (per card) ----------------------------------------------
 
+// Compute the two products' overlap and ADOPT it as this card's AOI.
+//
+// The button used to only print the bbox, which read as "nothing happened": the
+// card's four inputs stayed blank and the map did not move. The overlap is only
+// useful as an AOI, so it is written into the card (setCardBbox), drawn as the
+// dashed rectangle, and the maps are fitted to it — the same treatment an
+// uploaded boundary gets in uploadAoi().
+//
+// The AOI is a BOUNDING BOX, while the true overlap of two maps is whatever
+// shape their data happens to be (coastlines, missing tiles, no-data corners).
+// That is by design, not an approximation being papered over: sampling walks the
+// box cell by cell and a cell with no data in a product simply yields no
+// candidates there, so the points drawn are always inside real data. The only
+// cost of the box being larger than the true overlap is scan time spent on empty
+// cells. See DESIGN.md 3.1.
+//
+// A GLOBAL overlap is the one case that is NOT adopted: it is the whole planet,
+// so filling in [-180,-90,180,90] would replace "blank = full overlap" with a
+// box that means the same thing while looking like a deliberate choice, and on
+// the GEE path it is a hard blocker anyway. Same for an error response.
 async function checkOverlap(card) {
   const info = $("overlap-info");
   info.className = "info";
@@ -452,7 +943,13 @@ async function checkOverlap(card) {
   try {
     const body = {
       ...selectedPair(),
-      aoi: cardBbox(card),
+      // Deliberately NOT this card's current box. The endpoint intersects the
+      // products' footprints with whatever `aoi` it is given, so passing the
+      // card's own box made the answer "your box, again" — the button then
+      // looked broken on a filled-in card and only appeared to work after
+      // "clear". This asks the question the button actually poses: what is the
+      // overlap of the two selected maps?
+      aoi: null,
       sample_scale_m: Number($("sample_scale_m").value) || null,
     };
     const r = await getJSON("/api/overlap", {
@@ -461,13 +958,61 @@ async function checkOverlap(card) {
       body: JSON.stringify(body),
     });
     const bbox = r.bbox.map((x) => x.toFixed(3)).join(", ");
-    let msg = r.is_global
-      ? `“${cardLabel(card)}” overlap: GLOBAL (both maps global). bbox [${bbox}].`
-      : `“${cardLabel(card)}” overlap bbox: [${bbox}].`;
+
     if (r.blocker) {
       info.className = "info error";
       info.textContent = "✖ " + r.blocker;
-    } else if (r.slow_warning) {
+      return;
+    }
+
+    if (r.is_global) {
+      // Nothing to adopt: leave the card blank, which already means "the maps'
+      // full overlap" for the primary card.
+      info.textContent =
+        `“${cardLabel(card)}” overlap: GLOBAL (both maps global). ` +
+        `bbox [${bbox}]. Draw or type an AOI to bound the run.`;
+      return;
+    }
+
+    // Adopt it as the card's AOI.
+    const applied = r.bbox.map((x) => Number(x.toFixed(5)));
+    setCardBbox(card, applied);
+    setActiveCard(card.key);
+    drawAoiRect(applied);
+    await refreshFootprints();
+
+    let msg =
+      `“${cardLabel(card)}” AOI set to the maps' overlap: [${bbox}] ` +
+      `(bounding box — areas inside it with no data in either map are skipped ` +
+      `when sampling).`;
+
+    // Adopting the full overlap at the current scale can be a 3-hour run: the
+    // default 10 m over this overlap is ~27 billion pixels PER MAP. The whole
+    // point of computing `suggested_scale_m` is to avoid that, so apply it here
+    // rather than only mentioning it — a suggestion the user has to notice, do
+    // arithmetic on, and hand-enter is one they will miss, and the failure mode
+    // is a run that looks hung for hours.
+    //
+    // Only ever coarsens. If the user has already chosen a scale coarser than
+    // the suggestion, theirs is kept: they have accepted a cheaper run, and
+    // silently making it finer would be the same surprise in the other
+    // direction.
+    if (r.estimated_seconds != null) {
+      const mins = (s) => Math.max(1, Math.round(s / 60));
+      const scaleEl = $("sample_scale_m");
+      const current = Number(scaleEl.value) || r.sample_scale_m;
+      if (r.suggested_scale_m != null && r.suggested_scale_m > current) {
+        scaleEl.value = r.suggested_scale_m;
+        msg +=
+          `  Sample scale raised ${current} m → ${r.suggested_scale_m} m ` +
+          `(≈ ${mins(r.suggested_estimated_seconds)} min for both maps; ` +
+          `${current} m would be ≈ ${mins(r.estimated_seconds)} min). ` +
+          `Lower it again if you want the finer detail.`;
+      } else {
+        msg += `  Sampling both maps at ${current} m ≈ ${mins(r.estimated_seconds)} min.`;
+      }
+    }
+    if (r.slow_warning) {
       info.className = "info warn";
       info.textContent = msg + "  ⚠ " + r.slow_warning;
     } else {
@@ -1297,7 +1842,11 @@ function aoiCardEl(card) {
   card.runBtn = runBtn;
   tools.appendChild(runBtn);
   tools.appendChild(
-    miniBtn("check overlap", "Check the two products' overlap within this AOI", () => checkOverlap(card))
+    miniBtn(
+      "use overlap",
+      "Compute the two products' overlap and set it as this AOI",
+      () => checkOverlap(card)
+    )
   );
   const up = document.createElement("label");
   up.className = "mini-upload";
@@ -1481,6 +2030,99 @@ function sleep(ms) {
 let SANKEY = null; // single ECharts instance on #sankey
 let RESULTS = null; // last results payload (for the table viewer)
 
+// --- Stage 8d: semantic-prior alpha ---------------------------------------
+// Alpha is a DISPLAY control, not a run parameter: it sits outside the run
+// signature, so changing it re-decides Stage 4 from the cached models with no
+// GEE call and no re-sampling. It is kept in this module variable (session
+// state) rather than written back to config.py — exploration must not silently
+// rewrite the calibration Stage 8c established. Closing the app restores the
+// calibrated default.
+let ALPHA = null; // null until the defaults land; then the user's chosen value
+let ALPHA_DEFAULT = null; // the calibrated CONFIG value, for the anchor label
+
+function currentAlpha() {
+  return ALPHA == null ? (ALPHA_DEFAULT == null ? 1 : ALPHA_DEFAULT) : ALPHA;
+}
+
+// Reflect the slider position in its readout and note, without fetching.
+function paintAlpha() {
+  const a = currentAlpha();
+  $("alpha").value = String(a);
+  $("alpha-value").textContent = fmt(a, 2);
+  const note = $("alpha-note");
+  if (ALPHA_DEFAULT == null) {
+    note.textContent = "";
+  } else if (Math.abs(a - ALPHA_DEFAULT) < 1e-9) {
+    note.textContent = `calibrated value (α = ${fmt(ALPHA_DEFAULT, 2)})`;
+    note.classList.remove("alpha-off-default");
+  } else {
+    // Say plainly that the view no longer matches the project's calibration:
+    // the CLI scripts still use the config value, so the two can disagree.
+    note.textContent =
+      `display only — differs from the calibrated α = ${fmt(ALPHA_DEFAULT, 2)}` +
+      " used by config and the command-line scripts";
+    note.classList.add("alpha-off-default");
+  }
+}
+
+// Re-decide at the current alpha from the cached models and repaint. Cheap
+// (no GEE), but still guarded: it needs a completed run for the pair.
+async function applyAlpha() {
+  if (!RESULTS) return;
+  const wantAef = $("alpha-compare").checked;
+  const q = new URLSearchParams({
+    reference_id: RESULTS.reference_id,
+    compare_id: RESULTS.compare_id,
+    alpha: String(currentAlpha()),
+    include_aef: wantAef ? "true" : "false",
+  });
+  $("alpha-row").classList.add("busy");
+  try {
+    const r = await getJSON(`/api/affinity?${q}`);
+    RESULTS.matching_table = r.matching_table;
+    RESULTS.normalized_affinity = r.normalized_affinity;
+    RESULTS.raw_similarity = r.raw_similarity;
+    RESULTS.matching_table_aef = wantAef ? r.matching_table_aef : null;
+    drawSankey(RESULTS);
+    renderCsvView();
+  } catch (e) {
+    setCardProg(
+      primaryCard(),
+      `could not re-decide at α = ${fmt(currentAlpha(), 2)}: ${e.message}`,
+      true
+    );
+  } finally {
+    $("alpha-row").classList.remove("busy");
+  }
+}
+
+// Enable/disable the control: it recomputes from cached models, so before any
+// run there is nothing to recompute and the slider must say so rather than
+// silently returning an empty table.
+function setAlphaEnabled(on) {
+  $("alpha").disabled = !on;
+  $("alpha-compare").disabled = !on;
+  $("alpha-panel").classList.toggle("disabled", !on);
+  if (!on) $("alpha-note").textContent = "run a harmonization to enable";
+  else paintAlpha();
+}
+
+function wireAlpha() {
+  // input → live readout (cheap); change → the actual recompute on release, so
+  // dragging does not fire a request per step.
+  $("alpha").addEventListener("input", () => {
+    ALPHA = Number($("alpha").value);
+    paintAlpha();
+  });
+  $("alpha").addEventListener("change", () => {
+    ALPHA = Number($("alpha").value);
+    paintAlpha();
+    applyAlpha();
+  });
+  $("alpha-compare").addEventListener("change", applyAlpha);
+  setAlphaEnabled(false);
+}
+
 async function showResults(jobId) {
   const r = await getJSON(`/api/jobs/${jobId}/results`);
   RESULTS = r;
@@ -1493,6 +2135,21 @@ async function showResults(jobId) {
   );
   drawSankey(r);
   renderCsvView();
+
+  // Stage 8d: the run computed at the CONFIG alpha. If this session's slider
+  // sits elsewhere, re-decide so the view matches the control rather than
+  // silently showing a different alpha than the one displayed.
+  setAlphaEnabled(true);
+  const runAlpha = r.calibration ? r.calibration.semantic_prior_alpha : null;
+  if (
+    ALPHA != null &&
+    runAlpha != null &&
+    Math.abs(ALPHA - runAlpha) > 1e-9
+  ) {
+    await applyAlpha();
+  } else if ($("alpha-compare").checked) {
+    await applyAlpha();
+  }
 
   // Stage 7c: if auxiliaries already top up this pair, the deliverable is the
   // MERGED table (union of every AOI's rows, evidence_aoi-tagged), not the
@@ -1593,18 +2250,50 @@ function renderCsvView() {
   const which = $("csv-pick").value;
   // The matching table deliverable is the MERGED table (union of every AOI's
   // rows, evidence_aoi column included — Stage 7.4); the matrices stay per-run.
+  // Stage 8d: the matrices carry the current alpha so a download matches what is
+  // on screen. The merged table has its own multi-AOI path and no alpha param.
   $("csv-download").href =
     which === "matching_table"
       ? `/api/merged/export?reference_id=${encodeURIComponent(RESULTS.reference_id)}&compare_id=${encodeURIComponent(RESULTS.compare_id)}`
-      : `/api/jobs/${RESULTS.job_id}/export/${which}`;
+      : `/api/jobs/${RESULTS.job_id}/export/${which}?alpha=${encodeURIComponent(currentAlpha())}`;
   view.innerHTML = "";
-  view.appendChild(
-    which === "matching_table" ? matchingTable() : matrixTable(which)
-  );
+
+  if (which !== "matching_table") {
+    view.appendChild(matrixTable(which));
+    return;
+  }
+
+  // Stage 8d comparison view: when the α=0 table is also loaded, show it
+  // beneath the current one, each under its own heading, so the effect of the
+  // prior is readable without switching back and forth.
+  const aef = RESULTS.matching_table_aef;
+  if (aef && Math.abs(currentAlpha()) > 1e-9) {
+    const wrap = document.createElement("div");
+    wrap.className = "table-compare";
+    wrap.appendChild(
+      tableHeading(`α = ${fmt(currentAlpha(), 2)} — with semantic prior`)
+    );
+    wrap.appendChild(matchingTable(RESULTS.matching_table));
+    wrap.appendChild(tableHeading("α = 0 — observational only"));
+    wrap.appendChild(matchingTable(aef));
+    view.appendChild(wrap);
+    return;
+  }
+  view.appendChild(matchingTable(RESULTS.matching_table));
 }
 
-// The Stage-4 matching table, as an on-screen table.
-function matchingTable() {
+// A small heading above one table in the α comparison view.
+function tableHeading(text) {
+  const h = document.createElement("p");
+  h.className = "table-heading";
+  h.textContent = text;
+  return h;
+}
+
+// The Stage-4 matching table, as an on-screen table. ``rows`` defaults to the
+// current results so existing callers are unchanged; the α comparison view
+// passes the α=0 rows to render a second table from the same code.
+function matchingTable(rows) {
   const t = document.createElement("table");
   t.className = "matching";
   t.innerHTML =
@@ -1614,7 +2303,7 @@ function matchingTable() {
     "<th>best raw</th><th>margin</th><th>entropy</th><th>confidence</th>" +
     "</tr></thead>";
   const tb = document.createElement("tbody");
-  for (const row of RESULTS.matching_table) {
+  for (const row of rows || RESULTS.matching_table) {
     const tr = document.createElement("tr");
     tr.className = "status-" + row.status;
     // A compare-side row (Stage 7) reports a compare class nothing could map to,
@@ -1718,6 +2407,29 @@ function setupResizers() {
     const h = Math.max(120, Math.min(rect.height - 120, e.clientY - rect.top));
     main.style.setProperty("--maps-height", h + "px");
   });
+
+  // The map|legend divider, one per column. Both write the SAME variable
+  // (--legend-height on <main>), so dragging either resizes both legends
+  // together and the two maps stay aligned — which is the point: a side-by-side
+  // comparison is unreadable if the panes are different heights.
+  //
+  // Dragging UP grows the legend (useful for a 35-class legend like
+  // GLC_FCS30D); dragging DOWN shrinks it back toward one row of chips.
+  for (const id of ["resize-legend-ref", "resize-legend-cmp"]) {
+    const handle = $(id);
+    if (!handle) continue;
+    dragHandle(handle, "y", (e) => {
+      // Measure against this handle's own column, so the maths is the same
+      // whichever side is grabbed.
+      const col = handle.closest(".map-col");
+      const rect = col.getBoundingClientRect();
+      // Distance from the pointer to the bottom of the column = legend height.
+      // Floor of 40px keeps one row of chips visible; the cap leaves at least
+      // 120px of map so the legend can never swallow it entirely.
+      const h = Math.max(40, Math.min(rect.height - 120, rect.bottom - e.clientY));
+      main.style.setProperty("--legend-height", Math.round(h) + "px");
+    });
+  }
 
   // Vertical: pin the two left column widths in px; the third takes the rest.
   for (const handle of band.querySelectorAll(".resizer-col")) {
@@ -3042,6 +3754,89 @@ $("compare").addEventListener("change", async () => {
   await refreshMapSide("cmp");
   await refreshFootprints();
 });
+
+// Rescan data/ for datasets dropped in while the server was already running.
+$("refresh-datasets").addEventListener("click", refreshDatasets);
+
+// Offer to delete the derived files of datasets whose data/ folder is gone.
+//
+// Confirmed per dataset, naming the exact size, because the amount is not
+// trivial (a converted tile set runs to several GB) and the decision is the
+// user's: they may have moved the folder aside deliberately and intend to put
+// it back, in which case the COGs are worth keeping.
+async function offerCleanup(missing) {
+  const status = $("map-status");
+  for (const d of missing) {
+    let info;
+    try {
+      info = await getJSON(`/api/datasets/${d.product_id}/artifacts`);
+    } catch (_) {
+      continue;
+    }
+    if (!info.artifacts.length) continue;
+    const ok = window.confirm(
+      `“${d.folder}” was removed from data/, but ${info.size} of derived files ` +
+        `are still on disk:\n\n` +
+        info.artifacts.map((a) => "  • " + a).join("\n") +
+        `\n\nDelete them?\n\n` +
+        `(Your data/ folder is never touched. Choose Cancel to keep them — ` +
+        `restore the folder and press ↻ datasets to use the dataset again.)`
+    );
+    if (!ok) {
+      status.className = "note";
+      status.textContent =
+        `Kept ${info.size} of derived files for “${d.folder}”. ` +
+        `Restore the folder under data/ and press ↻ datasets to use it again.`;
+      continue;
+    }
+    try {
+      const res = await getJSON(`/api/datasets/${d.product_id}`, {
+        method: "DELETE",
+      });
+      status.className = "note";
+      status.textContent = `Removed “${d.folder}” — ${res.freed} freed.`;
+    } catch (e) {
+      status.className = "note error";
+      status.textContent = `Could not remove “${d.folder}”: ${e.message}`;
+    }
+  }
+  // Reflect the result in the pickers without a reload.
+  const data = await getJSON("/api/products");
+  const labels = data.products.filter((p) => p.kind === "label");
+  fillSelect($("reference"), labels);
+  fillSelect($("compare"), labels);
+}
+
+// Explain the drop-in naming convention, in the overlap-info panel (the app's
+// general "here is what just happened" area). Shown when a dataset is sitting
+// at needs-legend, which is exactly when the user needs to know the rule.
+async function showDropInRules(pending) {
+  const info = $("overlap-info");
+  let rules;
+  try {
+    rules = (await getJSON("/api/datasets")).rules;
+  } catch (_) {
+    return;
+  }
+  if (!rules) return;
+
+  const lines = [
+    `${pending.map((d) => d.folder).join(", ")} — no legend found.`,
+    "",
+    "Each dataset is one folder: its rasters, plus its legend beside them.",
+    "",
+    rules.layout,
+    "",
+    ...rules.steps.map((s, i) => `  ${i + 1}. ${s}`),
+    "",
+    `Legend CSV columns: ${rules.legend_columns.join(", ")}`,
+    "",
+    rules.note,
+  ];
+  info.className = "info warn";
+  info.style.whiteSpace = "pre-wrap";
+  info.textContent = lines.join("\n");
+}
 
 // (Typing a bounding box is handled per card in aoiCardEl: it updates the drawn
 // rectangle + footprints, and — on the primary — re-fits the Review maps.)

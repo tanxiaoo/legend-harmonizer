@@ -62,6 +62,9 @@ caches, and the merged matching table whose rows carry ``evidence_aoi``:
 from __future__ import annotations
 
 import hashlib
+import logging
+import math
+import os
 import threading
 import traceback
 import uuid
@@ -125,6 +128,72 @@ def _slow_estimate(
     area_m2 = area_deg2 * metres_per_deg * metres_per_deg
     score = area_m2 / (scale_m * scale_m) if scale_m > 0 else float("inf")
     return score, score > _SLOW_SCORE_THRESHOLD
+
+
+# Sample scales the auto-suggestion may choose from, finest first. These are
+# ordinary label-map resolutions rather than arbitrary numbers, so a suggested
+# scale is always one a user would recognise.
+_SCALE_LADDER = (10.0, 20.0, 30.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
+
+# Local chunked sampling is bounded by pixels read, not by GEE round trips, so it
+# tolerates far more than the GEE threshold above.
+#
+# Calibrated against a measured full-overlap run rather than guessed: hrlc30 x
+# worldcover_2020 (17.2 deg x 12.8 deg) at 30 m is 2.98e9 pixels and took 570 s
+# per map, i.e. **~190 s per gigapixel** on this machine. A run samples *both*
+# maps, so wall time is roughly 2 x that.
+#
+# The budget is therefore set so an auto-suggested scale keeps the whole run in
+# the minutes range, which DESIGN.md 3.3 asks for: 1.0e9 px/map is ~3 min/map,
+# ~6 min for the pair. (The previous 4.0e9 implied ~13 min/map / ~25 min a run --
+# defensible as a *ceiling*, but not what "auto-suggest something that finishes
+# in minutes" means.) A user who wants finer detail can still override the
+# suggestion; the estimate is always shown alongside it.
+_SECONDS_PER_GIGAPIXEL = 190.0
+_LOCAL_PIXEL_BUDGET = 1.0e9
+
+
+def _estimated_seconds(pixels: float) -> float:
+    """Rough wall-clock seconds to sample **both** maps over ``pixels`` each."""
+    return 2.0 * (pixels / 1e9) * _SECONDS_PER_GIGAPIXEL
+
+
+def _local_pixel_estimate(
+    bbox: tuple[float, float, float, float], scale_m: float
+) -> float:
+    """Approximate pixels the chunked sampler reads for an AOI at a scale.
+
+    ``pixels ~= overlap_area_m2 / sample_scale_m^2`` (DESIGN.md 3.3). Latitude is
+    accounted for, unlike the flat GEE heuristic above: a degree of longitude
+    shrinks with ``cos(lat)``, and these AOIs span tens of degrees.
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox
+    if scale_m <= 0:
+        return float("inf")
+    mid_lat = math.radians(0.5 * (min_lat + max_lat))
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = 111_320.0 * max(0.05, math.cos(mid_lat))
+    area_m2 = (
+        max(0.0, max_lon - min_lon)
+        * m_per_deg_lon
+        * max(0.0, max_lat - min_lat)
+        * m_per_deg_lat
+    )
+    return area_m2 / (scale_m * scale_m)
+
+
+def _suggest_scale(bbox: tuple[float, float, float, float]) -> float:
+    """The finest scale from the ladder that keeps an AOI within the pixel budget.
+
+    Returns the coarsest ladder entry when even that exceeds the budget -- the
+    caller still shows the estimate, so the user can decide to proceed or narrow
+    the AOI rather than being blocked (DESIGN.md 3.3: suggest, show the cost, and
+    let the user override).
+    """
+    for scale in _SCALE_LADDER:
+        if _local_pixel_estimate(bbox, scale) <= _LOCAL_PIXEL_BUDGET:
+            return scale
+    return _SCALE_LADDER[-1]
 
 
 # --------------------------------------------------------------------------- #
@@ -297,6 +366,8 @@ class UnconfirmRequest(BaseModel):
 # App
 # --------------------------------------------------------------------------- #
 
+_LOG = logging.getLogger(__name__)
+
 app = FastAPI(title="Legend Harmonizer", version="0.1.0")
 
 
@@ -315,21 +386,196 @@ def _local_raster_ready(spec) -> bool:
     return bool(p) and Path(p).is_file()
 
 
+@app.on_event("startup")
+def _autoregister_datasets() -> None:
+    """Register drop-in datasets found under ``data/`` (DESIGN.md 4.1).
+
+    Runs in background threads, so the server answers requests immediately and
+    the picker shows each product's state (``indexing…`` / ``converting…`` /
+    ``ready``) as it progresses. Failures land on the product as an ``error``
+    badge rather than making it silently absent.
+
+    Set ``HARMONIZER_NO_AUTOREGISTER=1`` to skip it -- useful for a quick server
+    start when the COG conversion of a large new dataset would otherwise begin
+    immediately.
+    """
+    if os.environ.get("HARMONIZER_NO_AUTOREGISTER"):
+        return
+    try:
+        from harmonizer import registration
+
+        jobs = registration.register_all_pending()
+        if jobs:
+            _LOG.info(
+                "auto-registering %d dataset(s): %s",
+                len(jobs),
+                ", ".join(j.product_id for j in jobs),
+            )
+    except Exception:  # never let this stop the server coming up
+        _LOG.exception("dataset auto-registration failed to start")
+
+
+@app.get("/api/datasets")
+def list_datasets() -> dict:
+    """Drop-in datasets under ``data/`` and their registration state.
+
+    The picker's source of truth for ready-state badges (DESIGN.md 4.2), and
+    what the "refresh datasets" action polls while registration runs.
+    """
+    from harmonizer import registration
+
+    states = [s.as_dict() for s in registration.scan_datasets()]
+    return {
+        "datasets": states,
+        "active": registration.REGISTRATIONS.active(),
+        "jobs": [j.as_dict() for j in registration.REGISTRATIONS.all().values()],
+        # The drop-in naming convention, so the UI can teach it at the point of
+        # failure rather than leaving it in a YAML comment.
+        "rules": registration.drop_in_rules(),
+    }
+
+
+@app.post("/api/datasets/refresh")
+def refresh_datasets() -> dict:
+    """Rescan ``data/`` and start registering anything not ready yet."""
+    from harmonizer import registration
+
+    jobs = registration.register_all_pending()
+    return {
+        "started": [j.as_dict() for j in jobs],
+        "datasets": [s.as_dict() for s in registration.scan_datasets()],
+    }
+
+
+@app.get("/api/datasets/{product_id}/artifacts")
+def dataset_artifacts(product_id: str) -> dict:
+    """The derived files a product owns, so the UI can say what removal deletes.
+
+    Read-only: this is what a confirmation prompt shows before anything is
+    touched.
+    """
+    from harmonizer import registration
+
+    paths = registration.product_artifacts(product_id)
+    return {
+        "product_id": product_id,
+        "artifacts": [str(p) for p in paths],
+        "size": registration._describe_size(paths),
+        "data_folder_present": (
+            CONFIG.data_dir / registration._folder_of(product_id)
+        ).is_dir(),
+    }
+
+
+@app.delete("/api/datasets/{product_id}")
+def delete_dataset(product_id: str, force: bool = False) -> dict:
+    """Remove a product's **derived** files (COGs, VRT, registry entry, caches).
+
+    Deliberately an explicit action rather than something a rescan does on its
+    own: deleting a data folder can strand several GB, but silently deleting
+    several GB because a folder went missing is the kind of surprise that loses
+    work. ``data/`` is never touched.
+
+    Refuses while the dataset's folder still exists unless ``force=true`` -- that
+    would not be a cleanup, it would be discarding a working product's converted
+    data.
+    """
+    from harmonizer import registration
+
+    try:
+        return registration.remove_product(product_id, force=force)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/products")
 def list_products() -> dict:
-    """The registry's products, so the UI offers only valid pairings."""
+    """The registry's products, so the UI offers only valid pairings.
+
+    Local-raster products carry their drop-in registration state (``ready`` /
+    ``indexing`` / ``converting`` / ``needs-legend`` / ``needs-conversion`` /
+    ``error``) so the picker can group and badge them, and disable the ones that
+    are not usable yet. GEE products are always ``ready``: there is nothing to
+    index or convert.
+    """
+    from harmonizer import registration
+
     reg = default_registry()
-    products = [
-        {
-            "id": p.id,
-            "name": p.name,
-            "kind": p.kind,
-            "role": p.role,
-            "source": p.spec.access.method,  # "local_raster" | "gee"
-        }
-        for p in reg.all()
-        if _local_raster_ready(p.spec)
-    ]
+    states = registration.product_states()
+    products = []
+    for p in reg.all():
+        is_local = p.spec.access.method == "local_raster"
+        state = states.get(p.id)
+        # A product whose data/ folder has been deleted is listed but DISABLED,
+        # rather than hidden. Hiding it would leave several GB of derived files
+        # on disk with nothing in the UI referring to them; showing it as
+        # `missing` is what gives the user something to clean up.
+        #
+        # This must come before the readiness check below, because for a tile set
+        # `access.path` is the VRT under cache/ -- which survives deleting the
+        # folder, so the file-exists test still passes and the product would
+        # otherwise appear perfectly selectable while every tile read fails.
+        if is_local and state is not None and state.state == registration.MISSING:
+            products.append(
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "kind": p.kind,
+                    "role": p.role,
+                    "source": p.spec.access.method,
+                    "state": registration.MISSING,
+                    "state_detail": state.detail,
+                    "progress": 0.0,
+                    "resolution_m": getattr(p.spec, "resolution_m", None),
+                    "years": list(getattr(p.spec, "available_years", None) or []),
+                }
+            )
+            continue
+        if not _local_raster_ready(p.spec):
+            continue
+        products.append(
+            {
+                "id": p.id,
+                "name": p.name,
+                "kind": p.kind,
+                "role": p.role,
+                "source": p.spec.access.method,  # "local_raster" | "gee"
+                "state": (state.state if state else "ready") if is_local else "ready",
+                "state_detail": state.detail if (is_local and state) else "",
+                "progress": state.progress if (is_local and state) else 1.0,
+                "resolution_m": getattr(p.spec, "resolution_m", None),
+                "years": list(getattr(p.spec, "available_years", None) or []),
+            }
+        )
+
+    # Datasets under data/ that are NOT in the registry yet -- a folder waiting
+    # for its legend.csv, one still indexing, or one whose registration failed.
+    #
+    # The loop above walks the *registry*, so an unregistered dataset has nothing
+    # to iterate over and was simply absent from the picker: dropping a folder in
+    # without a legend produced no response at all, which reads as "the app did
+    # not notice my folder" when in fact it had, and was waiting for a file. The
+    # whole point of the ready-state badges is that a dataset is never silently
+    # missing -- that has to include the ones that never got a registry entry.
+    listed = {p["id"] for p in products}
+    for state in registration.scan_datasets():
+        if state.product_id in listed or state.state == registration.READY:
+            continue
+        products.append(
+            {
+                "id": state.product_id,
+                "name": state.folder,  # no registry entry yet: the folder is the name
+                "kind": "label",
+                "role": "reference",
+                "source": "local_raster",
+                "state": state.state,
+                "state_detail": state.detail,
+                "progress": state.progress,
+                "resolution_m": None,
+                "years": [],
+            }
+        )
+
     return {
         "products": products,
         "working_year": CONFIG.maps.working_year,
@@ -343,6 +589,8 @@ def list_products() -> dict:
             "softmax_temperature": CONFIG.affinity.softmax_temperature,
             "absolute_affinity_floor": CONFIG.affinity.absolute_affinity_floor,
             "margin_threshold": CONFIG.affinity.margin_threshold,
+            # Stage 8d: the calibrated alpha the UI slider anchors on.
+            "semantic_prior_alpha": CONFIG.affinity.semantic_prior_alpha,
         },
         "review": {
             "patches_per_pair": CONFIG.review.patches_per_pair,
@@ -375,12 +623,37 @@ def overlap(req: OverlapRequest) -> dict:
     # Warn on the region that will actually be sampled.
     score, is_slow = _slow_estimate(ov.bbox, scale)
 
-    # A global region is not runnable: Stage 2 would sample the whole globe and GEE
-    # times out. This is a hard blocker (the user must supply an AOI), distinct
-    # from the soft slow-combination warning for a merely large-but-bounded AOI.
+    # Both maps local => the run never touches GEE for labels, and the chunked
+    # sampler streams the region cell by cell in bounded memory. The cost model
+    # and the global blocker are therefore different in kind (DESIGN.md 3.3).
+    both_local = _is_local_raster(req.reference_id) and _is_local_raster(req.compare_id)
+
     blocker = None
     warning = None
-    if ov.is_global:
+    suggested = None
+    estimated_pixels = None
+
+    if both_local:
+        suggested = _suggest_scale(ov.bbox)
+        estimated_pixels = _local_pixel_estimate(ov.bbox, scale)
+        estimated_seconds = _estimated_seconds(estimated_pixels)
+        # The full overlap is the default and is expected to be runnable here, so
+        # a large region is informational rather than a warning to be feared.
+        if estimated_pixels > _LOCAL_PIXEL_BUDGET:
+            warning = (
+                f"This AOI at {scale:.0f} m is about {estimated_pixels / 1e9:.1f} "
+                f"billion pixels per map -- roughly {estimated_seconds / 60:.0f} "
+                f"minutes to sample both. {suggested:.0f} m brings that to about "
+                f"{_estimated_seconds(_local_pixel_estimate(ov.bbox, suggested)) / 60:.0f} "
+                "minutes; a narrower AOI also works. You can run this anyway if "
+                "the finer scale is what you want."
+            )
+    elif ov.is_global:
+        # A global region is not runnable *on the GEE path*: Stage 2 would sample
+        # the whole globe server-side and time out. This is a hard blocker (the
+        # user must supply an AOI), distinct from the soft slow-combination
+        # warning for a merely large-but-bounded AOI. It deliberately does not
+        # apply to a local x local run, which samples in this process.
         blocker = (
             "Both maps are global, so the full overlap is the entire globe -- "
             "sampling it will time out on Earth Engine. Enter a bounding-box AOI "
@@ -401,6 +674,23 @@ def overlap(req: OverlapRequest) -> dict:
         "blocker": blocker,
         "slow_warning": warning,
         "slow_score": score,
+        # Local-path cost model: what this AOI costs at the chosen scale, and the
+        # finest scale that stays within budget. Null for runs involving GEE.
+        "both_local": both_local,
+        "suggested_scale_m": suggested,
+        "estimated_pixels": estimated_pixels,
+        "estimated_seconds": (
+            _estimated_seconds(estimated_pixels)
+            if estimated_pixels is not None
+            else None
+        ),
+        # What the *suggested* scale would cost, so the UI can offer the
+        # trade-off without recomputing the cost model client-side.
+        "suggested_estimated_seconds": (
+            _estimated_seconds(_local_pixel_estimate(ov.bbox, suggested))
+            if suggested is not None
+            else None
+        ),
     }
 
 
@@ -457,7 +747,13 @@ def footprints(
             raise HTTPException(
                 status_code=400, detail=f"unknown product id: {pid}"
             ) from exc
-        fp = prod.footprint
+        # The *operational* footprint -- rasterio bounds of the real source for a
+        # local product (DESIGN.md 3.1) -- so the box drawn here is the same
+        # extent the tile layer is confined to. The registry's declared box is
+        # advisory and can disagree.
+        from harmonizer.footprints import operational_footprint
+
+        fp = operational_footprint(prod.id)
         out_products.append(
             {
                 "id": prod.id,
@@ -471,19 +767,30 @@ def footprints(
     params = RunParams(
         reference_id=reference_id, compare_id=compare_id, aoi=aoi
     )
+    # A pair with NO overlap is a legitimate thing to look at -- an Africa map
+    # beside a Southeast Asia one -- and the footprints are exactly what the user
+    # needs to see to understand why. Previously this raised 400, the frontend's
+    # fetch threw, and it drew nothing at all: no boxes, and no view fit, so the
+    # maps stayed wherever they were showing the *previous* product's tiles.
+    # Report the empty overlap as data instead of as an error; /api/overlap and
+    # the run endpoint still refuse the run itself.
+    overlap_payload = None
+    overlap_error = None
     try:
         ov: Overlap = compute_overlap(params)
+        overlap_payload = {
+            "bbox": list(ov.bbox),
+            "geometry": _bbox_to_geojson(ov.bbox),
+            "is_global": ov.is_global,
+        }
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        overlap_error = str(exc)
 
     return {
         "products": out_products,
         "aoi": list(aoi) if aoi is not None else None,
-        "overlap": {
-            "bbox": list(ov.bbox),
-            "geometry": _bbox_to_geojson(ov.bbox),
-            "is_global": ov.is_global,
-        },
+        "overlap": overlap_payload,
+        "overlap_error": overlap_error,
     }
 
 
@@ -513,6 +820,10 @@ def legend(product_id: str) -> dict:
                 "name": e.name,
                 "color": e.color,
                 "description": e.description,
+                # None = not determined; False = declared by the legend but not
+                # present in this dataset's pixels (DESIGN.md 4.3), which the UI
+                # renders as a greyed, non-toggleable chip.
+                "observed": e.observed,
             }
             for e in entries
         ],
@@ -534,12 +845,22 @@ def _parse_classes(classes: str | None) -> list[int] | None:
 def label_tiles(product_id: str, classes: str | None = None) -> dict:
     """An XYZ tile-URL template for the product's label map.
 
-    ``classes`` is an optional comma-separated list of class values to render
-    (the per-class show/hide toggles); omit it to render every class. GEE-backed
-    products stream tiles straight from Earth Engine to the browser; local-raster
-    products are rendered by this process and served from
-    ``/api/tiles/local/{product}/{z}/{x}/{y}.png`` -- either way the frontend gets
-    back an opaque XYZ template it can hand straight to Leaflet.
+    GEE-backed products stream tiles straight from Earth Engine to the browser
+    and get a single ``template``, with ``classes`` baked into it.
+
+    Local-raster products are rendered by this process and answer with
+    ``encoding: "class_code"`` plus two templates:
+
+    ``template``
+        Class-code tiles (``.png``) -- one greyscale+alpha tile per position
+        encoding each pixel's class code, with no palette and no class subset
+        applied. The frontend colours these on a canvas, so toggling classes
+        costs no request at all (DESIGN.md 2.3). ``classes`` does not appear in
+        this URL by design.
+    ``template_rgba``
+        The server-coloured fallback (``/api/tiles/local/rgba/...``), which does
+        honour ``classes``. Every toggle state is a separate render and cache
+        entry here; it exists for clients that cannot decode codes themselves.
     """
     visible = _parse_classes(classes)
     if _is_local_raster(product_id):
@@ -549,15 +870,37 @@ def label_tiles(product_id: str, classes: str | None = None) -> dict:
             raise HTTPException(
                 status_code=404, detail=f"no tiles for product: {product_id}"
             ) from exc
+        # The class-code template (DESIGN.md 2.3) -- no ``?classes=``, because
+        # one tile per position serves every toggle state and the browser applies
+        # the palette. ``classes`` is still accepted on this endpoint and still
+        # drives ``template_rgba`` below, for clients that want a ready-coloured
+        # tile.
+        # ``rgba`` is its own path segment rather than a ``.rgba.png`` suffix:
+        # with a suffix, ``{y}.png`` matches first and the tile row fails to
+        # parse as an int (a 422, not a fallback).
         template = f"/api/tiles/local/{product_id}/{{z}}/{{x}}/{{y}}.png"
+        template_rgba = f"/api/tiles/local/rgba/{product_id}/{{z}}/{{x}}/{{y}}.png"
         if visible is not None:
-            template += "?classes=" + ",".join(str(v) for v in visible)
+            template_rgba += "?classes=" + ",".join(str(v) for v in visible)
         # Let the frontend upscale in the browser past the data's real
         # resolution instead of requesting finer tiles the raster cannot fill.
+        #
+        # ``bounds`` is the product's footprint, so Leaflet can be told the
+        # layer's real extent and simply not request tiles outside it. Without
+        # it the browser asks for every tile in the viewport, and a regional
+        # product answers 404 for most of them -- hundreds of console errors
+        # that are correct behaviour but drown out real failures.
+        spec = default_registry().spec(product_id)
+        footprint = getattr(spec, "footprint", None) if spec is not None else None
         return {
             "product_id": product_id,
             "template": template,
+            "template_rgba": template_rgba,
+            # Tells the frontend this template serves class *codes*, so it should
+            # colour them itself instead of drawing the PNG directly.
+            "encoding": "class_code",
             "max_native_zoom": local_tiles.max_native_zoom(product_id),
+            "bounds": list(footprint) if footprint else None,
         }
 
     try:
@@ -569,31 +912,18 @@ def label_tiles(product_id: str, classes: str | None = None) -> dict:
     return {"product_id": product_id, "template": template}
 
 
-@app.get("/api/tiles/local/{product_id}/{z}/{x}/{y}.png")
-def local_tile_png(
+def _tile_response(
     request: Request,
     product_id: str,
     z: int,
     x: int,
     y: int,
-    classes: str | None = None,
+    visible: list[int] | None,
+    kind: str,
 ) -> Response:
-    """A rendered PNG tile for a local-raster product's label map.
-
-    The counterpart of GEE tile streaming for products this process reads
-    directly from disk (docs/PIPELINE.md, Stage 5.2) -- see ``local_tiles.py``.
-
-    Tiles are immutable for a given (product, z/x/y, class selection): the class
-    codes only change when the underlying raster is replaced and reconverted. So
-    the response carries a long ``Cache-Control`` and an ``ETag``, which lets the
-    browser re-show a layer the user has already viewed without another request
-    -- the difference between toggling layers feeling instant and re-rendering
-    every tile each time. ``_tile_etag`` changes if the product's legend changes,
-    so a recoloured legend is not served stale.
-    """
-    visible = _parse_classes(classes)
+    """Shared conditional-GET plumbing for both local tile encodings."""
     try:
-        etag = _tile_etag(product_id, z, x, y, visible)
+        etag = _tile_etag(product_id, z, x, y, visible, kind)
     except KeyError as exc:
         raise HTTPException(
             status_code=404, detail=f"no tiles for product: {product_id}"
@@ -608,7 +938,10 @@ def local_tile_png(
         return Response(status_code=304, headers=headers)
 
     try:
-        png = local_tiles.tile_png(product_id, z, x, y, visible_values=visible)
+        if kind == "code":
+            png = local_tiles.code_tile_png(product_id, z, x, y)
+        else:
+            png = local_tiles.tile_png(product_id, z, x, y, visible_values=visible)
     except KeyError as exc:
         raise HTTPException(
             status_code=404, detail=f"no tiles for product: {product_id}"
@@ -620,23 +953,94 @@ def local_tile_png(
     return Response(content=png, media_type="image/png", headers=headers)
 
 
+@app.get("/api/tiles/local/{product_id}/{z}/{x}/{y}.png")
+def local_tile_png(
+    request: Request, product_id: str, z: int, x: int, y: int
+) -> Response:
+    """A **class-code** tile for a local-raster product's label map.
+
+    The counterpart of GEE tile streaming for products this process reads
+    directly from disk (docs/PIPELINE.md, Stage 5.2) -- see ``local_tiles.py``.
+
+    Each pixel carries its class code (greyscale) plus an alpha channel marking
+    nodata; no palette and no class subset are applied here. The browser colours
+    the tile on a canvas, which is what makes toggling classes free: **one tile
+    per position serves every toggle state**, so a toggle re-runs a local canvas
+    pass and issues no request (DESIGN.md 2.3).
+
+    Deliberately takes no ``classes`` parameter -- accepting one would reintroduce
+    per-subset cache entries for tiles whose bytes do not depend on the subset.
+
+    Tiles are immutable for a given (product, z/x/y, band): the class codes only
+    change when the underlying raster is replaced. So the response carries a long
+    ``Cache-Control`` and an ``ETag``. ``_tile_etag`` changes if the product's
+    band changes, so a re-banded product is not served stale.
+    """
+    return _tile_response(request, product_id, z, x, y, None, "code")
+
+
+@app.get("/api/tiles/local/rgba/{product_id}/{z}/{x}/{y}.png")
+def local_tile_rgba_png(
+    request: Request,
+    product_id: str,
+    z: int,
+    x: int,
+    y: int,
+    classes: str | None = None,
+) -> Response:
+    """A server-coloured RGBA tile: the documented fallback to code tiles.
+
+    Honours ``classes`` (the per-class show/hide toggles) by baking the subset
+    into the rendered pixels, which is why every toggle state is a separate
+    render, a separate cache entry and a separate ETag -- exactly the cost the
+    code-tile endpoint above removes. The frontend does not use this; it is kept
+    for clients that want a ready-coloured tile.
+    """
+    visible = _parse_classes(classes)
+    return _tile_response(request, product_id, z, x, y, visible, "rgba")
+
+
 def _tile_etag(
-    product_id: str, z: int, x: int, y: int, visible: list[int] | None
+    product_id: str,
+    z: int,
+    x: int,
+    y: int,
+    visible: list[int] | None,
+    kind: str = "rgba",
 ) -> str:
     """A cache validator for one rendered tile.
 
-    Covers everything that changes the PNG's bytes: the tile address, the
-    selected class subset, and the product's legend (values and colours). Raises
-    ``KeyError`` for a product that has no drawable legend, so an unknown product
-    still 404s before any rendering work.
+    Covers everything that changes the PNG's bytes: the tile address, the band
+    being rendered, and -- for the ``rgba`` encoding only -- the selected class
+    subset and the product's legend colours.
+
+    A ``code`` tile's bytes depend on **neither the subset nor the palette**, so
+    both are excluded from its validator: including them would expire tiles that
+    are still byte-identical, re-fetching data the browser already holds every
+    time a colour changed. Recolouring a legend now updates the map with no tile
+    traffic at all, because the colours are applied client-side.
+
+    The band is always included: for a multi-band annual series, changing
+    ``band:`` changes the year shown, and without it a browser holding a
+    week-long cached tile would keep showing the old one. Raises ``KeyError`` for
+    a product that has no drawable legend, so an unknown product still 404s
+    before any rendering work.
     """
     entries = local_tiles.legend(product_id)
+    indexes = local_tiles.band_indexes(product_id)
     parts = [
         product_id,
+        kind,
         f"{z}/{x}/{y}",
-        ",".join(str(v) for v in sorted(visible)) if visible is not None else "all",
-        ";".join(f"{e.value}:{e.color}" for e in entries),
+        f"band={'d' if indexes is None else indexes[0]}",
     ]
+    if kind != "code":
+        parts.append(
+            ",".join(str(v) for v in sorted(visible))
+            if visible is not None
+            else "all"
+        )
+        parts.append(";".join(f"{e.value}:{e.color}" for e in entries))
     return '"' + hashlib.sha1("|".join(parts).encode()).hexdigest()[:16] + '"'
 
 
@@ -748,7 +1152,20 @@ def start_run(req: RunRequest) -> dict:
     # globe server-side and GEE times out. Both maps here are global, so a blank
     # AOI yields a global region -- the user must supply an AOI to bound it. A
     # cache-reuse run does no GEE sampling, so it is exempt.
-    if ov.is_global and not (can_reuse_cache(params) or can_reuse_samples(params)):
+    #
+    # This guards the **GEE** path specifically (DESIGN.md 3.3 keeps it). A
+    # local x local run samples in this process via the chunked sampler, in
+    # memory bounded by one grid cell, so a large region is a cost to be shown
+    # rather than a reason to refuse -- and in any case two local products'
+    # derived footprints are never global.
+    both_local_run = _is_local_raster(params.reference_id) and _is_local_raster(
+        params.compare_id
+    )
+    if (
+        ov.is_global
+        and not both_local_run
+        and not (can_reuse_cache(params) or can_reuse_samples(params))
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -875,8 +1292,105 @@ def job_results(job_id: str) -> dict:
             "softmax_temperature": CONFIG.affinity.softmax_temperature,
             "absolute_affinity_floor": CONFIG.affinity.absolute_affinity_floor,
             "margin_threshold": CONFIG.affinity.margin_threshold,
+            # Stage 8d: the alpha this payload was computed at, and the
+            # calibrated default the slider anchors on. They differ whenever the
+            # user has moved the slider, which is why both are reported --
+            # the UI must be able to say which value is in force.
+            "semantic_prior_alpha": float(aff.alpha),
+            "semantic_prior_alpha_default": CONFIG.affinity.semantic_prior_alpha,
         },
     }
+
+
+# --------------------------------------------------------------------------- #
+# Stage 8d -- re-decide at a different semantic-prior alpha (no re-sampling)
+# --------------------------------------------------------------------------- #
+# Alpha is deliberately NOT part of the run signature (harmonizer/pipeline.py):
+# it only affects Stage 4, which is cheap and recomputed from the cached GMMs.
+# So changing it is a *view* operation costing no GEE quota and no re-sampling,
+# unlike sample scale / K / point floor, which invalidate the cache. That is the
+# whole reason this endpoint can exist.
+
+
+def _affinity_at_alpha(reference_id: str, compare_id: str, alpha: float | None):
+    """Recompute Stage 4 for a pair at one alpha, from the cached GMMs."""
+    from harmonizer.affinity import compute_affinity
+    from harmonizer.decision import (
+        absent_decisions,
+        build_matching_table,
+        classify_rows,
+    )
+
+    aff = compute_affinity(reference_id, compare_id, alpha=alpha)
+    decisions, _ = classify_rows(aff)
+    rows = build_matching_table(
+        aff, decisions, include_absent=absent_decisions(reference_id, aff)
+    )
+    return aff, rows
+
+
+@app.get("/api/affinity")
+def affinity_at_alpha(
+    reference_id: str,
+    compare_id: str,
+    alpha: float | None = None,
+    include_aef: bool = False,
+) -> dict:
+    """The matching table and matrices at a given semantic-prior ``alpha``.
+
+    Reads the **cached GMMs** and recomputes only Stage 4, so it needs a run to
+    have happened for this pair but costs no GEE call. ``alpha`` omitted uses the
+    calibrated ``CONFIG.affinity.semantic_prior_alpha``.
+
+    ``include_aef`` additionally returns the alpha = 0 (observational-only)
+    matching table under ``matching_table_aef``, so the UI can show the fused and
+    unfused answers side by side without a second request. It is off by default
+    because the comparison view is opt-in.
+    """
+    from harmonizer.modeling import gmm_cache_path
+
+    for pid in (reference_id, compare_id):
+        if not gmm_cache_path(pid).exists():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"no fitted models cached for {pid!r}; run a harmonization "
+                    "for this pair first"
+                ),
+            )
+
+    if alpha is not None and alpha < 0:
+        raise HTTPException(status_code=400, detail="alpha must be >= 0")
+
+    aff, rows = _affinity_at_alpha(reference_id, compare_id, alpha)
+
+    payload = {
+        "reference_id": aff.reference_id,
+        "compare_id": aff.compare_id,
+        "reference_labels": [
+            f"{cv}: {class_name(aff.reference_id, cv)}" for cv in aff.reference_classes
+        ],
+        "compare_labels": [
+            f"{cv}: {class_name(aff.compare_id, cv)}" for cv in aff.compare_classes
+        ],
+        "normalized_affinity": aff.normalized_affinity.tolist(),
+        "raw_similarity": aff.raw_similarity.tolist(),
+        "semantic_prior": (
+            aff.semantic_prior.tolist() if aff.semantic_prior is not None else None
+        ),
+        "matching_table": _matching_table_payload(rows),
+        "alpha": float(aff.alpha),
+        "alpha_default": CONFIG.affinity.semantic_prior_alpha,
+    }
+
+    if include_aef:
+        # The observational-only answer, for the comparison toggle. Recomputed
+        # rather than read off `normalized_affinity_aef`, because the *statuses*
+        # and candidate lists also differ at alpha = 0, not just the matrix.
+        _, aef_rows = _affinity_at_alpha(reference_id, compare_id, 0.0)
+        payload["matching_table_aef"] = _matching_table_payload(aef_rows)
+
+    return payload
 
 
 _EXPORTS = {
@@ -887,8 +1401,16 @@ _EXPORTS = {
 
 
 @app.get("/api/jobs/{job_id}/export/{which}")
-def export_csv(job_id: str, which: str) -> FileResponse:
-    """Download one of the three Stage-4 CSVs the run wrote to cache/."""
+def export_csv(job_id: str, which: str, alpha: float | None = None) -> FileResponse:
+    """Download one of the three Stage-4 CSVs the run wrote to cache/.
+
+    ``alpha`` (Stage 8d) re-exports at a different semantic-prior alpha, so a
+    download matches what the slider is currently showing rather than whatever
+    alpha the run happened to use. It is written to a **separate temp file**, not
+    over the run's cached artifacts: the cache belongs to the run, and a
+    what-if download must not overwrite it. Omitted, the run's own file is
+    served unchanged.
+    """
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="unknown job id")
@@ -900,10 +1422,45 @@ def export_csv(job_id: str, which: str) -> FileResponse:
         raise HTTPException(status_code=404, detail=f"unknown export: {which}")
 
     attr, filename = _EXPORTS[which]
+
+    run_alpha = float(job.result.affinity.alpha)
+    if alpha is not None and abs(float(alpha) - run_alpha) > 1e-12:
+        return _export_at_alpha(job, which, float(alpha), filename)
+
     path: Path = getattr(job.result, attr)
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"missing file: {filename}")
     return FileResponse(path, filename=filename, media_type="text/csv")
+
+
+def _export_at_alpha(job, which: str, alpha: float, filename: str) -> FileResponse:
+    """Write one CSV at an off-run alpha into a temp dir and serve it."""
+    import tempfile
+
+    from harmonizer.decision import (
+        save_matching_table_csv,
+        save_normalized_affinity_csv,
+        save_raw_similarity_csv,
+    )
+
+    if alpha < 0:
+        raise HTTPException(status_code=400, detail="alpha must be >= 0")
+
+    aff, rows = _affinity_at_alpha(
+        job.result.reference_id, job.result.compare_id, alpha
+    )
+    out = Path(tempfile.mkdtemp(prefix="export_alpha_")) / filename
+
+    if which == "matching_table":
+        save_matching_table_csv(rows, out)
+    elif which == "normalized_affinity":
+        save_normalized_affinity_csv(aff, out)
+    else:
+        # raw_similarity does not depend on alpha at all (it is the
+        # observational orphan signal), but serving it through the same path
+        # keeps the UI's download links uniform.
+        save_raw_similarity_csv(aff, out)
+    return FileResponse(out, filename=filename, media_type="text/csv")
 
 
 # --------------------------------------------------------------------------- #

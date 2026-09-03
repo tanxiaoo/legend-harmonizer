@@ -146,7 +146,9 @@ main {
 /* Esri-style map picker: just the map name + a dropdown arrow. */
 .map-select {
   width: auto;
-  max-width: 340px;
+  /* Wide enough for a full product name + its short metadata suffix, but still
+     capped so the floating control cannot cover the map on a narrow pane. */
+  max-width: 420px;
   border: none;
   background: transparent;
   color: var(--ink);
@@ -165,18 +167,50 @@ main {
 }
 .map-select:focus { outline: none; box-shadow: none; }
 
-/* Legend chips beneath each map. A FIXED height (same on both sides) means a map
-   without a legend reserves identical space, so both maps stay exactly aligned. */
+/* The dropdown POPUP is drawn by the OS, not by the page, so it does not inherit
+   the app's dark theme: it opens on a default white background while the options
+   keep --ink (near-white). The result was an unreadable list where only the
+   highlighted row could be seen. Give the options their own explicit background
+   and colour so the popup is legible whatever the platform default is. */
+.map-select option,
+.map-select optgroup {
+  background-color: var(--panel-2);
+  color: var(--ink);
+}
+/* Group headers ("Local datasets" / "GEE datasets") read as labels, not choices. */
+.map-select optgroup {
+  font-weight: 700;
+  font-style: normal;
+  color: var(--muted);
+}
+.map-select option {
+  font-weight: 400;
+  padding: 4px 8px;
+}
+/* A product that is still indexing/converting, or needs a legend, is listed but
+   not selectable. It must look deliberately unavailable rather than merely hard
+   to read -- which is why the enabled options above are full-contrast. */
+.map-select option:disabled {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* Legend chips beneath each map. The height is a SHARED variable rather than a
+   per-column value: both legends read the same `--legend-height`, so the two
+   maps stay exactly aligned no matter which divider the user drags, and a map
+   with no legend still reserves identical space. Resizable because a legend can
+   run to 35+ classes (GLC_FCS30D) — far more than one row of chips. */
 .legend {
   flex: 0 0 auto;
-  height: 74px;
+  height: var(--legend-height, 74px);
   padding: 8px 10px;
   overflow-y: auto;
   display: flex;
   flex-wrap: wrap;
   align-content: flex-start;
   gap: 6px 8px;
-  border-top: 1px solid var(--line);
+  /* No border-top: the draggable .resize-legend divider above already draws the
+     1px seam, and two lines read as a double rule. */
   background: var(--panel);
 }
 .legend .empty { color: var(--muted); font-size: 12px; }
@@ -204,6 +238,20 @@ main {
 }
 .legend-chip.off { opacity: 0.4; filter: saturate(0.4); }
 
+/* A class the legend declares but this dataset's pixels do not contain
+   (DESIGN.md 4.3). Distinct from `.off` (hidden by the user, restorable): this
+   one cannot be toggled at all, so it takes the not-allowed cursor, a dashed
+   border, and a fully desaturated swatch — it reads as "absent from the data",
+   not "currently switched off". */
+.legend-chip.absent {
+  opacity: 0.45;
+  cursor: not-allowed;
+  border-style: dashed;
+  text-decoration: line-through;
+}
+.legend-chip.absent:hover { border-color: var(--line); }
+.legend-chip.absent .swatch { filter: grayscale(1); }
+
 /* --- Drag handles between regions ---------------------------------------- */
 
 /* A thin 1px seam (matching the map divider) with a wider invisible grab area so
@@ -225,6 +273,14 @@ main {
 .resizer:hover, .resizer:focus, .resizer.dragging {
   background: var(--accent);
   outline: none;
+}
+
+/* The map|legend divider. 1px like the others but it sits between two panels of
+   very different colour, so it needs its own height to be grabbable — the
+   ::before pad above already widens the hit area to 9px. */
+.resize-legend {
+  flex: 0 0 auto;
+  height: 1px;
 }
 
 /* --- Bottom band: AOI | run | Sankey ------------------------------------- */
@@ -840,3 +896,53 @@ label.mini-upload:hover { color: var(--ink); background: var(--raised); }
 #param-panel .row.aoi { margin-top: 6px; }
 #param-panel label.inline { margin-top: 8px; }
 #run-all-row { margin-top: 12px; }
+
+/* --- Stage 8d: semantic-prior alpha (display-only control) ------------------
+   Visually set apart from #param-panel above by a rule and its own heading:
+   those parameters re-sample from GEE when changed, this one only re-decides
+   from the cached models. The separation is the point, not decoration. */
+#alpha-panel {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+#alpha-panel .panel-head h2 {
+  font-size: 12px;
+  margin: 0;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#alpha-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+#alpha-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+#alpha-value {
+  min-width: 3.2em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  font-weight: 600;
+}
+#alpha-row.busy { opacity: 0.55; }
+#alpha-panel label.inline { margin-top: 8px; }
+#alpha-panel.disabled { opacity: 0.5; }
+#alpha-panel.disabled input { cursor: not-allowed; }
+/* Off-calibration is a real caveat (the CLI still uses the config value), so
+   it is marked, not left to be inferred from the number alone. */
+#alpha-note.alpha-off-default { color: var(--mixed); }
+
+/* Stage 8d comparison view: the fused and observational tables stacked, each
+   under its own heading. */
+.table-heading {
+  margin: 12px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.table-compare .table-heading:first-child { margin-top: 0; }

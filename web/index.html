@@ -50,7 +50,19 @@
           <div id="map-ref" class="map"></div>
           <div class="map-controls" id="ref-map-title" title="Reference map">
             <select id="reference" class="map-select" aria-label="reference map"></select>
+            <button
+              id="refresh-datasets"
+              class="mini"
+              title="Rescan data/ for newly dropped datasets and register them"
+            >↻ datasets</button>
           </div>
+          <div
+            class="resizer resizer-row resize-legend"
+            id="resize-legend-ref"
+            role="separator"
+            aria-orientation="horizontal"
+            title="Drag to resize the legend area (both maps together)"
+          ></div>
           <div class="legend" id="legend-ref"></div>
         </div>
         <div class="map-col">
@@ -58,6 +70,13 @@
           <div class="map-controls" id="cmp-map-title" title="Compare map">
             <select id="compare" class="map-select" aria-label="compare map"></select>
           </div>
+          <div
+            class="resizer resizer-row resize-legend"
+            id="resize-legend-cmp"
+            role="separator"
+            aria-orientation="horizontal"
+            title="Drag to resize the legend area (both maps together)"
+          ></div>
           <div class="legend" id="legend-cmp"></div>
         </div>
       </div>
@@ -149,6 +168,31 @@
           <div id="overlap-info" class="info"></div>
           <p class="note" id="map-status"></p>
           <p class="note" id="calibration-note"></p>
+
+          <!-- Stage 8d: the semantic-prior weight. Deliberately SEPARATED from
+               the parameters panel above, and placed at the end of the column,
+               because it is a different KIND of control: everything above
+               re-samples from GEE when changed (it is part of the run
+               signature), while alpha only re-runs the cheap Stage 4 from the
+               cached models. Grouping them would imply a cost that isn't
+               there — and would suggest alpha is part of what gets cached. -->
+          <div id="alpha-panel">
+            <div class="panel-head"><h2>Semantic prior — display only</h2></div>
+            <p class="note">
+              Weight of the LCCS definition prior in the crosswalk. Re-decides
+              from the cached models — no re-sampling, no GEE. The observational
+              parameters above are unaffected.
+            </p>
+            <div class="row" id="alpha-row">
+              <input id="alpha" type="range" min="0" max="2" step="0.05" value="1" />
+              <output id="alpha-value" for="alpha">1.00</output>
+            </div>
+            <p class="note" id="alpha-note"></p>
+            <label class="inline">
+              <input id="alpha-compare" type="checkbox" />
+              also show the α = 0 table (observational only)
+            </label>
+          </div>
         </section>
 
         <div class="resizer resizer-col" data-col="1" role="separator" aria-orientation="vertical" tabindex="0"></div>
