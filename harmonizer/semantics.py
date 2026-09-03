@@ -244,9 +244,28 @@ def inclusion(
 # --------------------------------------------------------------------------- #
 
 
+#: Separator that scopes a product id to one auxiliary AOI
+#: (``harmonizer.auxiliary.aux_scoped_id``, e.g. ``worldcover_2020__aux_coast``).
+_AUX_SCOPE = "__aux_"
+
+
+def base_product_id(product_id: str) -> str:
+    """Strip an auxiliary-AOI scope suffix to get the registry product id.
+
+    An auxiliary AOI reuses the Stage 2/3 machinery under a scoped id so its
+    per-AOI caches sit in their own files. That id has no registry entry, so a
+    naive lookup would find no legend, fall back to a uniform prior, and leave
+    auxiliary rows observational while primary rows are fused -- in the same
+    merged table. The legend is a property of the *product*, not of which AOI
+    it was sampled in, so the scope is dropped here.
+    """
+    head, sep, _ = product_id.partition(_AUX_SCOPE)
+    return head if sep else product_id
+
+
 def _semantics_by_code(product_id: str) -> dict[int, ClassSemantics] | None:
     """Every legend class's encoding for a product, or None if not fully encoded."""
-    spec = _product_spec(product_id)
+    spec = _product_spec(base_product_id(product_id))
     if spec is None or not spec.has_semantics:
         return None
     return {c.code: c.semantics for c in spec.legend if c.semantics is not None}
@@ -280,7 +299,7 @@ def semantic_prior(
     ref_sem = _semantics_by_code(reference_id)
     cmp_sem = _semantics_by_code(compare_id)
     missing = [
-        pid
+        base_product_id(pid)
         for pid, sem in ((reference_id, ref_sem), (compare_id, cmp_sem))
         if sem is None
     ]

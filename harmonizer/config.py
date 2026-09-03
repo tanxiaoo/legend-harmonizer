@@ -195,16 +195,21 @@ class AffinityConfig:
     # ``-d_ij / T + alpha * log pi_ij``. 0 reproduces the AEF-only behaviour
     # bit-for-bit.
     #
-    # Calibrated by the Stage 8c sweep against data/hrlc30_worldcover_crosswalk.csv
-    # with T held fixed, on the hrlc30_africa x worldcover_2020 pair. Over the 10
-    # modelled reference classes, mean per-row Jaccard rises 0.511 -> 0.900 across
-    # alpha 0 -> 1 and then plateaus: 1.25, 1.5, 2 and 5 all score identically, so
-    # 1.0 is the *smallest* alpha reaching the maximum. Prefer that end of the
-    # plateau -- a larger alpha buys nothing here and lets the prior override
-    # observational evidence on pairs the crosswalk never covered. Top-1 hit rate
-    # is flat at 0.900 throughout, i.e. the prior sharpens candidate sets rather
-    # than changing which class wins. (tune)
-    semantic_prior_alpha: float = 1.0
+    # DEFAULT 0: the prior is OFF unless asked for. The pipeline's own answer is
+    # the observational one, and a semantic prior derived from hand-transcribed
+    # legend attributes should be something a user opts into and can see the
+    # effect of -- not a silent default shaping every result. The UI slider
+    # (Stage 8d) starts here and moving it re-decides from the cached models.
+    #
+    # The Stage 8c sweep (against data/hrlc30_worldcover_crosswalk.csv, T held
+    # fixed, hrlc30_africa x worldcover_2020) found alpha = 1.0 the best value
+    # *when the prior is used*: over the 10 modelled reference classes mean
+    # per-row Jaccard rises 0.511 -> 0.900 across alpha 0 -> 1, then plateaus
+    # (1.25, 1.5, 2 and 5 all score identically), so 1.0 is the smallest alpha
+    # reaching the maximum. Top-1 hit rate is flat at 0.900 throughout: the
+    # prior sharpens candidate sets rather than changing which class wins.
+    # Set this to 1.0 to make the fused table the project-wide default. (tune)
+    semantic_prior_alpha: float = 0.0
     # Lower clip on each veto-attribute score (surface, cultivation, life form):
     # a mismatch is a strong penalty, never an impossibility. (tune)
     semantic_veto_floor: float = 0.10

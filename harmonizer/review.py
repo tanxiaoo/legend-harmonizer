@@ -190,18 +190,35 @@ def save_feedback(store: FeedbackStore) -> Path:
 _AFFINITY_MEMO: dict[tuple, AffinityResult] = {}
 
 
-def cached_affinity(reference_id: str, compare_id: str) -> AffinityResult:
-    """Stage 4 affinity for a pair, memoised on the two GMM caches' mtimes."""
+def cached_affinity(
+    reference_id: str, compare_id: str, alpha: float | None = None
+) -> AffinityResult:
+    """Stage 4 affinity for a pair, memoised on the two GMM caches' mtimes.
+
+    ``alpha`` (Stage 8d) is part of the memo key: the same cached models yield a
+    different fused table at a different semantic-prior weight, so keying only
+    on the mtimes would serve one alpha's result for another's request. ``None``
+    means the calibrated ``CONFIG.affinity.semantic_prior_alpha``, resolved here
+    so the key is the *effective* value and an omitted alpha hits the same entry
+    as its explicit equivalent.
+    """
+    from harmonizer.config import CONFIG
+
+    effective = CONFIG.affinity.semantic_prior_alpha if alpha is None else float(alpha)
     key = (
         reference_id,
         compare_id,
         gmm_cache_path(reference_id).stat().st_mtime_ns,
         gmm_cache_path(compare_id).stat().st_mtime_ns,
+        effective,
     )
     aff = _AFFINITY_MEMO.get(key)
     if aff is None:
-        aff = compute_affinity(reference_id, compare_id)
-        _AFFINITY_MEMO.clear()  # only the current caches' result is ever needed
+        aff = compute_affinity(reference_id, compare_id, alpha=effective)
+        # Keep only entries for the CURRENT caches; a stale-mtime entry can
+        # never be requested again, but several alphas of the current one can.
+        for stale in [k for k in _AFFINITY_MEMO if k[2:4] != key[2:4]]:
+            del _AFFINITY_MEMO[stale]
         _AFFINITY_MEMO[key] = aff
     return aff
 

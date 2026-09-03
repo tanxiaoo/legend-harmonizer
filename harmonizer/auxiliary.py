@@ -66,7 +66,10 @@ from harmonizer.pipeline import (
 )
 from harmonizer.sampling import (
     MapSample,
+    _count_candidates_both,
     _label_image_for,
+    _stratified_candidates,
+    drawable_classes,
     cache_path as sample_cache_path,
     present_classes,
     sample_class,
@@ -76,6 +79,33 @@ from harmonizer.sampling import (
 ProgressCb = Callable[[float, str], None]
 
 _EMBEDDING_ID = "alphaearth"
+
+
+def _sample_gee_class(
+    label_image, class_value: int, overlap, label_adapter, embedding_adapter
+):
+    """``sample_class`` for a GEE label image, building its two closures.
+
+    ``sample_class`` takes ``count_candidates_both`` / ``draw_candidates``
+    callables rather than an image (so the GEE and local paths can share the
+    absent-vs-buffered-away rule). This mirrors how ``sampling._sample_map_gee``
+    builds them; auxiliary AOIs still sample GEE-side, so they need the same two.
+    """
+    return sample_class(
+        class_value,
+        label_adapter,
+        embedding_adapter,
+        count_candidates_both=lambda erode_pixels: _count_candidates_both(
+            label_image, class_value, overlap, erode_pixels=erode_pixels
+        ),
+        draw_candidates=lambda erode_pixels: _stratified_candidates(
+            label_image,
+            class_value,
+            overlap,
+            erode_pixels=erode_pixels,
+            target=CONFIG.sampling.points_target,
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -701,8 +731,17 @@ def sample_auxiliary(
             label_images[pid] = _label_image_for(pid).clip(region)
             label_adapters[pid] = reg.get(pid).adapter_factory()
             need = target_side == "both" or bool(sides[pid].targeted)
+            # Filtered to the legend's real classes, so a fill value observed in
+            # this AOI (0 / "No Data" / "Unclassifiable") is never sampled here
+            # either -- same rule as the primary run.
             present[pid] = (
-                set(present_classes(label_images[pid], region)) if need else set()
+                set(
+                    drawable_classes(
+                        pid, present_classes(label_images[pid], region)
+                    )
+                )
+                if need
+                else set()
             )
             sides[pid].found = [
                 cv for cv in sides[pid].targeted if cv in present[pid]
@@ -727,7 +766,7 @@ def sample_auxiliary(
                     0.10 + 0.45 * (done / n_plan),
                     f"sampling class {cv} of {pid}",
                 )
-                samples[pid][cv] = sample_class(
+                samples[pid][cv] = _sample_gee_class(
                     label_images[pid], cv, overlap,
                     label_adapters[pid], embedding_adapter,
                 )
@@ -763,7 +802,7 @@ def sample_auxiliary(
                         0.60 + 0.30 * (done / n_co),
                         f"sampling co-present class {cv} of {pid}",
                     )
-                    samples[pid][cv] = sample_class(
+                    samples[pid][cv] = _sample_gee_class(
                         label_images[pid], cv, overlap,
                         label_adapters[pid], embedding_adapter,
                     )
@@ -842,17 +881,24 @@ def _side_dict(s: AuxSideOutcome) -> dict:
 
 
 def aux_affinity(
-    reference_id: str, compare_id: str, aux_name: str
+    reference_id: str, compare_id: str, aux_name: str, alpha: float | None = None
 ) -> AffinityResult:
     """The self-consistent affinity sub-matrix of one auxiliary AOI.
 
     Both sides' GMMs were fitted in that AOI, so every distance is within-AOI.
     Computed from the per-AOI caches via the scoped ids, then re-labelled with
     the base product ids so class names resolve from the registry as usual.
+
+    ``alpha`` (Stage 8d) fuses this sub-matrix at the same semantic-prior weight
+    as the primary, so a merged table does not mix fused and unfused rows. The
+    prior itself resolves the scoped ids back to their base products
+    (``semantics.base_product_id``), since the legend belongs to the product
+    rather than to the AOI it was sampled in.
     """
     aff = compute_affinity(
         aux_scoped_id(reference_id, aux_name),
         aux_scoped_id(compare_id, aux_name),
+        alpha=alpha,
     )
     aff.reference_id = reference_id
     aff.compare_id = compare_id
@@ -860,7 +906,7 @@ def aux_affinity(
 
 
 def merged_matching_table(
-    reference_id: str, compare_id: str
+    reference_id: str, compare_id: str, alpha: float | None = None
 ) -> tuple[list[MatchingRow], dict]:
     """The union of every AOI's matching-table rows, tagged with ``evidence_aoi``.
 
@@ -876,11 +922,18 @@ def merged_matching_table(
     edges in its row with ``evidence_aoi="none"`` -- the expert, not an AOI, is
     its evidence. Returns ``(rows, info)`` where ``info`` names the auxiliaries
     that contributed.
+
+    ``alpha`` (Stage 8d) sets the semantic-prior weight for every AOI's
+    sub-matrix, so the merged deliverable is fused at the same weight the UI is
+    displaying. Omitted, it is the calibrated config value. This must be
+    threaded through: the merged table REPLACES the primary-only one whenever a
+    pair has auxiliaries, so leaving it at the default would silently undo the
+    user's alpha choice on exactly those runs.
     """
     from harmonizer.absence import covered_classes
     from harmonizer.review import cached_affinity, load_feedback
 
-    aff = cached_affinity(reference_id, compare_id)
+    aff = cached_affinity(reference_id, compare_id, alpha)
     decisions, _ = classify_rows(aff)
     rows = build_matching_table(aff, decisions, include_compare_absent=False)
 
@@ -899,7 +952,7 @@ def merged_matching_table(
     for entry in active_auxiliaries():
         aux_name = entry["name"]
         try:
-            aaff = aux_affinity(reference_id, compare_id, aux_name)
+            aaff = aux_affinity(reference_id, compare_id, aux_name, alpha)
         except FileNotFoundError:
             continue
         if not aaff.reference_classes or not aaff.compare_classes:

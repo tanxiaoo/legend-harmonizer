@@ -284,6 +284,44 @@ def main() -> int:
                 f"exported at alpha={off_alpha}",
             )
 
+    # ---------------------------------------------------------------- 4b. #
+    _rule("4b. The MERGED table honours alpha too")
+
+    # The merged table replaces the primary-only one whenever a pair has
+    # auxiliaries, and the UI calls it right after applying alpha. If it ignored
+    # alpha it would silently revert the user's choice on exactly those runs --
+    # which is not visible in a pair that happens to have no auxiliaries, so it
+    # is asserted directly here.
+    merged = {}
+    for alpha in (0.0, 1.0):
+        m = client.get("/api/merged/table", params={**pair, "alpha": alpha})
+        ok &= check(
+            m.status_code == 200, f"merged table at alpha={alpha} returned 200",
+            f"got {m.status_code}"
+        )
+        if m.status_code == 200:
+            merged[alpha] = _summarise(m.json()["matching_table"])
+    ok &= check(
+        len(merged) == 2 and merged[0.0] != merged[1.0],
+        "merged table differs between alpha 0 and 1 (alpha reaches every AOI)",
+    )
+    ok &= check(
+        client.get("/api/merged/table", params={**pair, "alpha": -1}).status_code
+        == 400,
+        "merged table refuses a negative alpha",
+    )
+
+    # The auxiliary sub-matrices resolve their scoped ids back to base products
+    # for the prior; otherwise auxiliary rows stay observational while primary
+    # rows are fused, inside one table.
+    from harmonizer.semantics import base_product_id
+
+    ok &= check(
+        base_product_id("worldcover_2020__aux_coast") == "worldcover_2020"
+        and base_product_id("worldcover_2020") == "worldcover_2020",
+        "an auxiliary-scoped id resolves to its base product for the prior",
+    )
+
     # ---------------------------------------------------------------- 5. #
     _rule("5. Products payload carries the calibrated alpha")
 

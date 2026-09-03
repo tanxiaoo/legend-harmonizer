@@ -1231,6 +1231,10 @@ async function refreshMergedTable() {
   const q = new URLSearchParams({
     reference_id: RESULTS.reference_id,
     compare_id: RESULTS.compare_id,
+    // Stage 8d: the merged table REPLACES the primary-only one whenever the
+    // pair has auxiliaries, so it must be fused at the displayed alpha —
+    // otherwise this call silently reverts the user's choice.
+    alpha: String(currentAlpha()),
   });
   const m = await getJSON(`/api/merged/table?${q}`);
   RESULTS.matching_table = m.matching_table;
@@ -2041,7 +2045,19 @@ let ALPHA = null; // null until the defaults land; then the user's chosen value
 let ALPHA_DEFAULT = null; // the calibrated CONFIG value, for the anchor label
 
 function currentAlpha() {
-  return ALPHA == null ? (ALPHA_DEFAULT == null ? 1 : ALPHA_DEFAULT) : ALPHA;
+  return ALPHA == null ? (ALPHA_DEFAULT == null ? 0 : ALPHA_DEFAULT) : ALPHA;
+}
+
+// True when the current pair has auxiliary AOIs, in which case the deliverable
+// is the MERGED table rather than the primary-only rows (Stage 7.4).
+function hasAuxiliaries() {
+  if (!RESULTS) return false;
+  if (RESULTS.auxiliaries && RESULTS.auxiliaries.length) return true;
+  return !!(
+    RESULTS.absence &&
+    RESULTS.absence.auxiliaries &&
+    RESULTS.absence.auxiliaries.length
+  );
 }
 
 // Reflect the slider position in its readout and note, without fetching.
@@ -2050,17 +2066,25 @@ function paintAlpha() {
   $("alpha").value = String(a);
   $("alpha-value").textContent = fmt(a, 2);
   const note = $("alpha-note");
+  const off = Math.abs(a) < 1e-9;
   if (ALPHA_DEFAULT == null) {
     note.textContent = "";
+    return;
+  }
+  if (off) {
+    // α = 0 is not "a calibrated value", it is the prior switched off — say so
+    // plainly, since that is the state the table is actually in.
+    note.textContent = "prior off — observational (embedding) result only";
+    note.classList.remove("alpha-off-default");
   } else if (Math.abs(a - ALPHA_DEFAULT) < 1e-9) {
-    note.textContent = `calibrated value (α = ${fmt(ALPHA_DEFAULT, 2)})`;
+    note.textContent = `matches config (α = ${fmt(ALPHA_DEFAULT, 2)})`;
     note.classList.remove("alpha-off-default");
   } else {
-    // Say plainly that the view no longer matches the project's calibration:
-    // the CLI scripts still use the config value, so the two can disagree.
+    // The CLI scripts read config, so an off-config slider means the UI and the
+    // command line disagree. That has to be visible, not inferred.
     note.textContent =
-      `display only — differs from the calibrated α = ${fmt(ALPHA_DEFAULT, 2)}` +
-      " used by config and the command-line scripts";
+      `display only — config and the command-line scripts still use α = ` +
+      `${fmt(ALPHA_DEFAULT, 2)}`;
     note.classList.add("alpha-off-default");
   }
 }
@@ -2079,12 +2103,21 @@ async function applyAlpha() {
   $("alpha-row").classList.add("busy");
   try {
     const r = await getJSON(`/api/affinity?${q}`);
-    RESULTS.matching_table = r.matching_table;
+    // The matrices are always the primary pair's.
     RESULTS.normalized_affinity = r.normalized_affinity;
     RESULTS.raw_similarity = r.raw_similarity;
     RESULTS.matching_table_aef = wantAef ? r.matching_table_aef : null;
-    drawSankey(RESULTS);
-    renderCsvView();
+    RESULTS.matching_table = r.matching_table;
+
+    // With auxiliaries, the deliverable is the MERGED table (Stage 7.4), so
+    // take it from the merged endpoint at this alpha rather than the
+    // primary-only rows just fetched — otherwise moving the slider would also
+    // silently drop the auxiliaries' rows.
+    if (hasAuxiliaries()) await refreshMergedTable();
+    else {
+      drawSankey(RESULTS);
+      renderCsvView();
+    }
   } catch (e) {
     setCardProg(
       primaryCard(),

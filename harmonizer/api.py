@@ -1757,17 +1757,26 @@ def delete_aux_aoi(name: str, reference_id: str, compare_id: str) -> dict:
 
 
 @app.get("/api/merged/table")
-def merged_table(reference_id: str, compare_id: str) -> dict:
+def merged_table(
+    reference_id: str, compare_id: str, alpha: float | None = None
+) -> dict:
     """The merged matching table: the union of every AOI's rows (Stage 7.4).
 
     Recomputed from the on-disk primary and per-auxiliary caches; each row
     carries ``evidence_aoi``. Also returns the net absence report so the UI's
     dialog and notes reflect auxiliary coverage without a second request.
+
+    ``alpha`` (Stage 8d) must be forwarded: this table REPLACES the primary-only
+    one whenever the pair has auxiliaries, so ignoring alpha here would silently
+    undo the user's choice on exactly those runs.
     """
     from harmonizer.auxiliary import absence_report_all_aois, merged_matching_table
 
+    if alpha is not None and alpha < 0:
+        raise HTTPException(status_code=400, detail="alpha must be >= 0")
+
     try:
-        rows, info = merged_matching_table(reference_id, compare_id)
+        rows, info = merged_matching_table(reference_id, compare_id, alpha)
     except FileNotFoundError as exc:
         raise HTTPException(
             status_code=409,
@@ -1784,23 +1793,34 @@ def merged_table(reference_id: str, compare_id: str) -> dict:
         "matching_table": _matching_table_payload(rows),
         "absence": absence_report_all_aois(reference_id, compare_id),
         "max_auxiliary_aois": CONFIG.absence.max_auxiliary_aois,
+        "alpha": (
+            CONFIG.affinity.semantic_prior_alpha if alpha is None else float(alpha)
+        ),
     }
 
 
 @app.get("/api/merged/export")
-def merged_export(reference_id: str, compare_id: str) -> FileResponse:
+def merged_export(
+    reference_id: str, compare_id: str, alpha: float | None = None
+) -> FileResponse:
     """The merged matching table as ``matching_table.csv`` -- the deliverable.
 
     The matching table is defined as the union of the AOIs' rows (docs 7.4), so
     this rewrites ``cache/matching_table.csv`` with the current merged rows
     (evidence_aoi column included) and serves it. With no auxiliaries it is the
     primary table unchanged, evidence_aoi reading "primary" throughout.
+
+    ``alpha`` (Stage 8d) fuses at the displayed semantic-prior weight, so the
+    downloaded deliverable matches what is on screen.
     """
     from harmonizer.auxiliary import merged_matching_table
     from harmonizer.decision import save_matching_table_csv
 
+    if alpha is not None and alpha < 0:
+        raise HTTPException(status_code=400, detail="alpha must be >= 0")
+
     try:
-        rows, _ = merged_matching_table(reference_id, compare_id)
+        rows, _ = merged_matching_table(reference_id, compare_id, alpha)
     except FileNotFoundError as exc:
         raise HTTPException(
             status_code=409,
