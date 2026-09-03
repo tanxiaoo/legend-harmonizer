@@ -19,9 +19,15 @@ Reference CSV format, one row per reference class::
     10,10|20
     141,
 
-An empty ``compare_values`` means "this class should have no match". Such a row
-counts as correct when the pipeline reports ``orphan`` or ``semantic_orphan``,
-which is how a legitimate non-correspondence is scored rather than punished.
+The column pair may also be named ``<Anything>_Code,<Anything>_Code`` (the first
+column is the reference side), which is how a hand-made crosswalk usually comes
+out of a spreadsheet. Several rows may repeat the same reference class to express
+a one-to-many mapping; their targets are unioned.
+
+An empty ``compare_values`` -- blank, ``-``, ``none`` or ``na`` -- means "this
+class should have no match". Such a row counts as correct when the pipeline
+reports ``orphan`` or ``semantic_orphan``, which is how a legitimate
+non-correspondence is scored rather than punished.
 
 Two metrics, per direction:
 
@@ -79,19 +85,54 @@ def _alpha_tag(alpha: float) -> str:
     return f"{alpha:g}".replace(".", "p")
 
 
+# Cell values that all mean "this class has no counterpart". A hand-made
+# crosswalk writes this several ways, and reading one of them as a class code
+# would silently score a real non-correspondence as a miss.
+_NO_MATCH = {"", "-", "--", "none", "na", "n/a", "null"}
+
+
 def load_reference(path: Path) -> dict[int, set[int]]:
-    """Read a reference crosswalk CSV into {reference_value: {compare_values}}."""
+    """Read a reference crosswalk CSV into {reference_value: {compare_values}}.
+
+    Accepts either the canonical ``reference_value,compare_values`` header or a
+    ``<X>_Code,<Y>_Code`` pair, taking the first column as the reference side.
+    Repeated reference classes are unioned, so a one-to-many mapping may be
+    written either as ``10,20|30`` on one row or as two rows.
+    """
     out: dict[int, set[int]] = {}
     with path.open(encoding="utf-8-sig", newline="") as fh:
-        for row in csv.DictReader(fh):
-            key = (row.get("reference_value") or "").strip()
-            if not key:
+        reader = csv.reader(fh)
+        header = next(reader, None)
+        if header is None:
+            raise ValueError(f"crosswalk is empty: {path}")
+
+        cols = [h.strip().lower() for h in header]
+        if "reference_value" in cols:
+            ref_i = cols.index("reference_value")
+            cmp_i = cols.index("compare_values") if "compare_values" in cols else 1
+        elif len(cols) >= 2:
+            # A spreadsheet-style header such as HRLC_Code,WorldCover_Code.
+            ref_i, cmp_i = 0, 1
+        else:
+            raise ValueError(
+                f"crosswalk needs two columns (reference, compare); got {header!r}"
+            )
+
+        for row in reader:
+            if len(row) <= max(ref_i, cmp_i):
                 continue
-            raw = (row.get("compare_values") or "").strip()
+            key = row[ref_i].strip()
+            if not key or key.lower() in _NO_MATCH:
+                continue
+            raw = row[cmp_i].strip()
             values = {
-                int(v) for v in raw.replace(",", "|").split("|") if v.strip()
+                int(v)
+                for v in raw.replace(",", "|").split("|")
+                if v.strip() and v.strip().lower() not in _NO_MATCH
             }
-            out[int(key)] = values
+            # Union rather than overwrite: a one-to-many mapping is often
+            # written as one row per target.
+            out.setdefault(int(key), set()).update(values)
     return out
 
 

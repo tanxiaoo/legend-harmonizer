@@ -193,8 +193,18 @@ class AffinityConfig:
     # -- Semantic prior (Stage 8; docs/PIPELINE.md section 2) ------------------ #
     # Exponent alpha on the semantic prior pi in the fused logits
     # ``-d_ij / T + alpha * log pi_ij``. 0 reproduces the AEF-only behaviour
-    # bit-for-bit; set after the Stage 8c sweep with T held fixed. (tune)
-    semantic_prior_alpha: float = 0.0
+    # bit-for-bit.
+    #
+    # Calibrated by the Stage 8c sweep against data/hrlc30_worldcover_crosswalk.csv
+    # with T held fixed, on the hrlc30_africa x worldcover_2020 pair. Over the 10
+    # modelled reference classes, mean per-row Jaccard rises 0.511 -> 0.900 across
+    # alpha 0 -> 1 and then plateaus: 1.25, 1.5, 2 and 5 all score identically, so
+    # 1.0 is the *smallest* alpha reaching the maximum. Prefer that end of the
+    # plateau -- a larger alpha buys nothing here and lets the prior override
+    # observational evidence on pairs the crosswalk never covered. Top-1 hit rate
+    # is flat at 0.900 throughout, i.e. the prior sharpens candidate sets rather
+    # than changing which class wins. (tune)
+    semantic_prior_alpha: float = 1.0
     # Lower clip on each veto-attribute score (surface, cultivation, life form):
     # a mismatch is a strong penalty, never an impossibility. (tune)
     semantic_veto_floor: float = 0.10
