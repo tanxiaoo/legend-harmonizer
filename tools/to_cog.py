@@ -151,6 +151,24 @@ def _nodata_for(product_id: str, src_nodata):
     return None
 
 
+def _band_for(product_id: str) -> int | None:
+    """The single band to extract, for a multi-band product.
+
+    A product whose registry entry names an integer ``band`` (an annual time
+    series such as GLC_FCS30D, where each band is one year) is converted down to
+    just that band: the tile renderer only ever reads it, and copying all 23
+    would make the COG tree ~23x larger and the conversion that much slower for
+    data nothing displays. Single-band products return ``None`` -- copy as-is.
+    """
+    s = _product_spec(product_id)
+    if s is None or s.band is None:
+        return None
+    try:
+        return int(s.band)
+    except (TypeError, ValueError):
+        return None  # a named GEE band; not meaningful for a local GeoTIFF
+
+
 def _needs_conversion(src: Path, dst: Path, force: bool) -> bool:
     """True when ``dst`` is missing, stale, or not a valid COG."""
     if force or not dst.exists():
@@ -164,7 +182,7 @@ def _needs_conversion(src: Path, dst: Path, force: bool) -> bool:
     return not valid
 
 
-def _write_cog(src: Path, dst: Path, nodata) -> None:
+def _write_cog(src: Path, dst: Path, nodata, band: int | None = None) -> None:
     """Stream ``src`` into a tiled, overviewed COG at ``dst``.
 
     Written against rasterio directly rather than ``rio_cogeo.cog_translate``
@@ -178,12 +196,24 @@ def _write_cog(src: Path, dst: Path, nodata) -> None:
     Overviews are built with ``MODE`` -- the most common class code in each
     block. Averaging or interpolating would fabricate codes that appear nowhere
     in the legend.
+
+    ``band``, when given, extracts that one band and writes a single-band COG
+    (see ``_band_for``). The output is then band 1 regardless of which band it
+    came from, which is why the registry's ``band:`` must keep pointing at the
+    *source* band -- ``local_tiles`` only applies it when reading the original,
+    and a converted single-band COG needs no index at all.
     """
     from rasterio.shutil import copy as rio_copy
     from rasterio.windows import Window
 
     with rasterio.open(src) as ds:
+        if band is not None and band > ds.count:
+            raise ValueError(
+                f"{src.name}: band {band} requested but the file has {ds.count}"
+            )
         profile = ds.profile.copy()
+        if band is not None:
+            profile.update(count=1)
         profile.update(
             driver="GTiff",
             tiled=True,
@@ -210,7 +240,12 @@ def _write_cog(src: Path, dst: Path, nodata) -> None:
                 for top in range(0, ds.height, rows):
                     height = min(rows, ds.height - top)
                     window = Window(0, top, ds.width, height)
-                    out.write(ds.read(window=window), window=window)
+                    if band is None:
+                        out.write(ds.read(window=window), window=window)
+                    else:
+                        out.write(
+                            ds.read(band, window=window), 1, window=window
+                        )
 
                 # MODE overviews down to roughly one screen tile, so a zoomed-out
                 # request reads a small pre-computed level instead of the source.
@@ -261,7 +296,7 @@ def _convert_one(product_id: str, src: Path, force: bool) -> tuple[Path, str, st
         # leave a truncated file that _needs_conversion would later accept.
         tmp = dst.with_name(dst.stem + ".partial.tmp")
         t0 = time.time()
-        _write_cog(src, tmp, nodata)
+        _write_cog(src, tmp, nodata, band=_band_for(product_id))
         tmp.replace(dst)
         return dst, "converted", f"{time.time() - t0:.1f}s"
     except Exception as exc:  # keep one bad tile from killing the whole run

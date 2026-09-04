@@ -2,6 +2,19 @@
 "Where the raster work happens" -- the local-raster path deferred from the
 original build).
 
+**Superseded for production use by ``harmonizer.chunked_sampling``**
+(DESIGN.md section 3.2). The read-everything-once approach documented below is
+correct but bounded by RAM: it reads the whole AOI at native resolution in one
+``ds.read()``, which for a full local x local overlap (~10^11 pixels) is
+impossible, and it ignores ``sample_scale_m`` entirely. ``sampling.py`` now
+drives local products through the chunked sampler instead.
+
+This module is **kept deliberately as the reference implementation**: it is the
+straightforward, obviously-correct expression of the same rules, and
+``scripts/verify_s1.py`` checks the chunked path against it on a small AOI --
+where they must agree class for class. Do not delete it, and do not "optimise"
+it; its value is being simple enough to trust.
+
 ``harmonizer.sampling`` and ``harmonizer.buffering`` do the erosion,
 homogeneity-window check, and stratified candidate draw as **server-side GEE
 image operations**, so this is the same logic against a local GeoTIFF (or VRT
@@ -38,8 +51,6 @@ import numpy as np
 from harmonizer.config import CONFIG
 from harmonizer.overlap import Overlap
 from harmonizer.registry.products import Coord
-
-_CELL_PROP = "cell"  # unused here; kept for symmetry with sampling.py's constant
 
 
 # --------------------------------------------------------------------------- #

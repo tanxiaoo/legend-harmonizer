@@ -131,6 +131,18 @@ parameters exposed in the UI, not fixed constants:
 - High-entropy threshold: 0.65 — retained as a reported diagnostic only; it is no longer the `strong`/`mixed` classifier.
 - Absolute-affinity floor: on the row's best raw (pre-normalisation) similarity `s = 1/(1+d)`; below it the class is an orphan. **0.60** *(tune)* — read off the observed raw-similarity distribution (values bunch 0.47–0.91; 0.60 sits below every genuine best match and above the weakest, non-matching rows). Its **shipped default was `None`** (uncalibrated), and the guard remains: **while the floor is `None`, orphan classification must not run** — Stage 4 must fail or warn and leave orphan status unassigned rather than default the floor and mark every class an orphan. The two-pass flow (emit distribution → set floor → re-run) is how 0.60 was obtained.
 
+**Semantic prior (Stage 8)**
+- `semantic_prior_alpha`: **0.0** *(tune)* — exponent α on the semantic prior π in the fused logits `−d_ij / T + α · log π_ij`. 0 reproduces the AEF-only behaviour bit-for-bit; set after the Stage 8c sweep, with `T` held fixed.
+- `semantic_veto_floor`: **0.10** *(tune)* — lower clip on each veto-attribute score (surface, cultivation, life form), so a mismatch is a strong penalty, never an impossibility (WorldCover grassland may contain uncultivated cropland; HRLC croplands include annual pastures).
+- `semantic_orphan_floor`: **0.30** *(tune)* — a row is flagged `semantic_orphan` when `max_j π_ij` is below it. Reported alongside, never replacing, the observational orphan status.
+- `semantic_prior_epsilon`: **1e-6** — lower clip on π before the logarithm (numerical only).
+- Categorical correspondence (FAO cb5130en Appendix B, Table 8-1, scores ÷ 10; same value = 1.0):
+  - life form: tree/shrub 0.6, tree/herbaceous 0.3, shrub/herbaceous 0.4, woody/lichen_moss 0.1, herbaceous/lichen_moss 0.4;
+  - surface: vegetated/bare 0.3, water/snow 0.3, all other cross pairs 0.1;
+  - cultivation: natural/cultivated 0.3;
+  - leaf type and phenology: different 0.3.
+- Interval attributes (cover %, height m, flooding months) use directed inclusion `|src ∩ tgt| / |src|`; unspecified on either side scores 1.0; open-ended bounds cap at cover 100, height 50, flooding 12.
+
 **Multi-AOI absence handling (Stage 7)**
 - Auxiliary AOI limit: **3** *(tune)* per run, so a run cannot fan out into an
   unbounded number of GEE sampling passes.
@@ -1339,6 +1351,227 @@ an expert-confirmed edge on it persists.
 - **7c — Auxiliary AOIs.** Per-AOI sampling/caching, targeted class selection with
   co-present classes from the other map, per-AOI sub-matrices, the merged table with
   `evidence_aoi`, and the review-picker fallback.
+
+---
+
+## Stage 8 — Semantic prior from LCCS attributes
+
+**Pair in scope:** `hrlc30_africa` ↔ `worldcover_2020`. Other products are untouched
+(see "Out of scope" at the end of this stage).
+
+### Why
+
+The AEF + GMM pipeline measures whether pixels labelled X in map A *look like* pixels
+labelled Y in map B. It cannot separate classes that are semantically distinct but
+spectrally similar (cropland vs grassland, irrigated crops vs herbaceous wetland).
+Stage 8 adds a **semantic prior** built from each legend's LCCS attribute encoding,
+folded into the existing row-softmax as a power prior, plus a **disagreement report**
+that keeps the observational (α = 0) and fused tables side by side.
+
+### Design decisions (settled; do not re-litigate)
+
+- Structured **LCCS v2 attributes**, not neural text embeddings. WorldCover's Product
+  User Manual v2.0 Table 3 gives explicit LCCS codes; the CCI HRLC Product User Guide
+  Table 5 gives LCCS-style prose with explicit thresholds, hand-transcribed.
+- Categorical likeness uses the **FAO correspondence table** (FAO cb5130en, *Register
+  implementation for land cover legends*, Appendix B, Table 8-1, scores 1–10, ÷ 10).
+  Interval attributes use **directed interval inclusion** (fraction of the source
+  interval lying inside the target), under a uniform-density assumption that is
+  stated, not hidden.
+- The prior is **asymmetric** (inclusion, source → target). Source-side OR
+  alternatives take the **max**; target-side alternatives are **merged attribute-wise**
+  (union) before scoring.
+- **Veto attributes** (surface, cultivation, life form) combine multiplicatively and
+  are clipped from below at `semantic_veto_floor`, never zero. Graded attributes
+  (leaf type, phenology, cover, height, flooding) are averaged.
+- Fusion: `logit_ij = −d_ij / T + α · log π_ij`, then the existing row-softmax.
+  `T` stays at its section-2 value; `α` (`semantic_prior_alpha`) is swept in
+  Stage 8c, never co-tuned with `T`.
+- **Orphans stay observational** (the raw-similarity floor is untouched). A separate
+  `semantic_orphan` flag marks rows whose best π is below `semantic_orphan_floor`.
+- **Direction needs no pipeline change.** `compute_affinity(ref, cmp)` is already
+  recomputed with swapped roles by the direction toggle (`decision.py` →
+  `compute_affinity_directed`), so a prior built for the ordered pair (rows = first
+  id, columns = second id) is oriented correctly in both directions for free.
+- Products without a `semantics` block get a uniform prior (π ≡ 1) and a warning, so
+  every other pair keeps today's behaviour exactly.
+- The crosswalk table from an earlier thesis is an *illustration* of the cardinalities
+  the tool must handle (one-to-many, many-to-one, zero), not a tuning target. The
+  pipeline must produce its best table on its own; the reference is used only to read
+  an α off a one-dimensional sweep and is reported as such.
+
+All constants live in section 2 → "Semantic prior (Stage 8)" and are read through
+`config.py` (`AffinityConfig`). Build strictly 8a → 8b → 8c, with the verification
+script of each sub-stage run and committed before the next.
+
+### Stage 8a — Attribute encoding + semantic similarity module
+
+**Goal.** A per-class attribute block in the registry YAML, a parser, and a pure
+function that returns the directed prior matrix π for any ordered product pair.
+
+**8a.1 Schema** (`harmonizer/registry/schema.py`). Add a frozen dataclass
+`ClassSemantics` and an optional `semantics` field on `LegendClass`; parse it in
+`_parse_legend`. `ProductSpec` gains `has_semantics` (true when every legend class
+carries a block).
+
+```yaml
+semantics:
+  alternatives:              # one entry per OR-branch; single-branch classes have one
+    - surface: vegetated     # vegetated | built | bare | water | snow
+      cultivation: natural   # natural | cultivated | any
+      life_form: tree        # tree | shrub | herbaceous | lichen_moss | any
+      leaf_type: any         # broadleaf | needleleaf | any
+      phenology: any         # evergreen | deciduous | any
+      cover: [10, 100]       # % of dominant life form; omit = unspecified
+      height: [5, null]      # metres; null = open-ended; omit = unspecified
+      flooding: [0, 12]      # months/year; [0,0] = dry; omit = unspecified
+```
+
+`any` / omitted = unspecified. Unknown enum values raise at load time.
+
+**8a.2 Encodings** (YAML edits).
+
+`worldcover_2020.yaml`, from the WorldCover PUM v2.0 Table 3:
+
+| code | alternatives (key attributes) |
+|---|---|
+| 10 Tree cover | tree, cultivation any, cover [10,100], height [5,∞], flooding [0,12] — 3 alternatives (A12A3 natural; A11A1 cultivated; A24A3 natural flooded) |
+| 20 Shrubland | shrub, natural, cover [10,100], height [0,5], flooding [0,0] |
+| 30 Grassland | herbaceous, natural, cover [10,100], flooding [0,0] |
+| 40 Cropland | herbaceous, cultivated — 2 alternatives: dry `[0,0]` (A11A3) and aquatic `[1,12]` (A23) |
+| 50 Built-up | built |
+| 60 Bare / sparse | bare, cover [0,10] |
+| 70 Snow and ice | snow, flooding unspecified (persistent) |
+| 80 Permanent water | water, flooding [9,12] |
+| 90 Herbaceous wetland | herbaceous, natural, cover [10,100], flooding [1,12] |
+| 95 Mangroves | tree, natural, flooding [1,12] (intertidal) |
+| 100 Moss and lichen | lichen_moss, natural |
+
+`hrlc30_africa.yaml`, from the CCI HRLC PUG Table 5:
+
+| code | attributes |
+|---|---|
+| 10/20/30/40 | tree, cultivation any, cover [50,100], height [5,∞], flooding [0,0]; leaf/phenology fixed per class (10 broad/evergreen, 20 needle/evergreen, 30 broad/deciduous, 40 needle/deciduous) |
+| 50/60 | shrub, cultivation any, cover [50,100], height [0,5], phenology evergreen/deciduous |
+| 70 | herbaceous, natural, cover [50,100], flooding [0,0] |
+| 80 | herbaceous, cultivated, cover [50,100], flooding unspecified (includes aquatic crops) |
+| 90 | 2 alternatives: tree and shrub, cover [50,100], flooding [4,12] |
+| 100 | 2 alternatives: herbaceous and lichen_moss, cover [50,100], flooding [4,12] |
+| 110 | lichen_moss, cover [50,100] |
+| 120 | bare, cover [0,50] |
+| 130 | built |
+| 140 | water, flooding [5,12] (parent of 141/142; kept for legend completeness) |
+| 141 | water, flooding [5,9] |
+| 142 | water, flooding [9,12] |
+| 150 | snow, flooding [9,12] |
+
+The HRLC 50 % boilerplate ("snow/ice, water or built-up cover < 50 %") is ignored.
+
+**8a.3 Module** `harmonizer/semantics.py` (new).
+
+- Correspondence tables come from `config.py` (section 2), one per categorical
+  attribute, values in [0, 1].
+- `attribute_score(attr, src, tgt)`: categorical → table lookup, unspecified on either
+  side → 1.0; interval → `|src ∩ tgt| / |src|`, unspecified → 1.0; an open-ended
+  `null` bound is capped at the attribute's natural max (cover 100, height 50,
+  flooding 12).
+- `inclusion(src_alt, tgt_merged) = ∏_veto max(score, semantic_veto_floor) × mean_graded score`.
+  Veto set: surface, cultivation, life_form. Graded set: leaf_type, phenology, cover,
+  height, flooding.
+- `merge_alternatives(tgt_alts)`: categorical → set union (score = max over members);
+  interval → hull.
+- `semantic_prior(reference_id, compare_id, ref_classes, cmp_classes) -> np.ndarray`
+  (M×N, values in (0, 1]): `π_ij = max_k inclusion(alt_k(i), merged(j))`. If either
+  product lacks semantics → `np.ones` and `warnings.warn`.
+- `semantic_orphans(prior) -> np.ndarray[bool]` using `semantic_orphan_floor`.
+
+**Verification** `scripts/verify_stage8a.py`. Prints π for both directions of the
+pair as labelled tables and asserts:
+
+- all π in (0, 1]; HRLC 10 → WC 10 = 1.0; WC 10 → HRLC 10 ≈ 0.56 (cover inclusion 50/90);
+- asymmetry: `π[WC10→HRLC10] < π[HRLC10→WC10]`;
+- WC 40 Cropland → HRLC 70 Grassland equals the veto-floor-driven value and is the
+  smallest entry in that row among vegetated targets;
+- WC 95 Mangroves → HRLC 90 is the row maximum; HRLC 141 seasonal water has
+  `max π < semantic_orphan_floor` (semantic orphan) while HRLC 142 → WC 80 = 1.0;
+- WC 10 → HRLC 10/20/30/40 are all equal (no leaf-type information on the source side);
+- a product without semantics (e.g. `dynamicworld`) yields all-ones and a warning.
+
+### Stage 8b — Fold the prior into the affinity, decision, and CSVs
+
+**Goal.** With `α = 0` every existing output is byte-identical; with `α > 0` the
+prior reshapes the softmax rows. Orphans unchanged.
+
+**Edits.**
+
+- `harmonizer/affinity.py`: `compute_affinity` accepts `alpha: float | None`
+  (default from config); builds `prior` via `semantics.semantic_prior`;
+  `logits = −distance/T + alpha · log(clip(prior, semantic_prior_epsilon))`.
+  `raw_similarity` is unchanged. `AffinityResult` gains `semantic_prior` (M×N),
+  `alpha`, `semantic_orphan` (M,), and an unfused `normalized_affinity_aef` (α = 0)
+  so the disagreement report does not need a second run.
+- `harmonizer/decision.py`: `ClassDecision` / `MatchingRow` gain
+  `semantic_orphan: bool`, `best_semantic_value/name`, `aef_best_compare_value`
+  (argmax of the α = 0 row), and `agreement` ∈ {`agree`, `semantic_overrides`,
+  `aef_only`, `both_orphan`}. `classify_rows` is unchanged except that it reads the
+  fused row. `save_matching_table_csv` writes the new columns; add
+  `save_semantic_prior_csv` and `save_aef_affinity_csv` beside
+  `save_normalized_affinity_csv`. `compute_affinity_directed` needs no change.
+- `harmonizer/pipeline.py`: save the two extra CSVs in `run_pipeline`; expose
+  `alpha` on `RunParams` (optional, default `None` → config).
+- `harmonizer/config.py`: the section-2 constants and correspondence tables.
+- No UI/API change in this stage; the fused table flows through the existing
+  endpoints. An α control in the UI is a possible later 8d, outside this plan.
+
+**Verification** `scripts/verify_stage8b.py`, on the cached GMMs for the pair (run
+the pipeline once first if absent):
+
+1. Regression: `compute_affinity(..., alpha=0)` → `normalized_affinity`, statuses and
+   matching-table CSV identical to a pre-stage run (saved copy, or recompute with the
+   prior forced to ones).
+2. `alpha=1`: for WC 40 Cropland the probability on HRLC 70 drops and on HRLC 80
+   rises; for WC 10 the split across HRLC 10–40 is unchanged in *ratio* (flat prior
+   there); orphan statuses identical between α = 0 and α = 1.
+3. `semantic_orphan` set for HRLC 141; `agreement` populated for every row; the
+   three new CSVs exist with matching headers and shapes.
+4. Direction toggle: `compute_affinity_directed(..., "compare_to_reference")` uses
+   the transposed-orientation prior (check one asymmetric cell).
+
+### Stage 8c — α sweep and disagreement report
+
+**Goal.** A reproducible script that produces the calibration curve and the
+two-dimensional disagreement view, so α can be chosen and justified.
+
+- `scripts/semantic_sweep.py`: for α in {0, 0.25, 0.5, 0.75, 1.0}, both directions,
+  write `matching_table_alpha{α}_{dir}.csv`; if `--reference path.csv` (optional,
+  `reference_value,compare_values|...`) is given, print per-α set-overlap metrics —
+  per-row Jaccard between listed candidates and the reference set, and top-1 hit
+  rate — separately per direction. Rows with an empty reference set score as correct
+  when the pipeline reports `orphan` or `semantic_orphan`.
+- `scripts/disagreement_report.py`: per class pair, `s_aef = raw_similarity`,
+  `s_sem = π`; classify into quadrants using the existing `absolute_affinity_floor`
+  and `semantic_orphan_floor`: agree-match, agree-nonmatch, spectral-confusion (sem
+  low, aef high), definition-drift (sem high, aef low). Emit `disagreement.csv` and a
+  scatter PNG (matplotlib).
+- **Verification** `scripts/verify_stage8c.py`: runs both scripts on the cached pair,
+  checks the α = 0 sweep table equals the Stage 8b regression output, and that the
+  quadrant counts sum to M×N.
+
+After 8c the human picks α, sets `semantic_prior_alpha` in section 2 / `config.py`,
+and the UI shows the fused table automatically.
+
+### Files touched
+
+- Modify: `harmonizer/registry/schema.py`, `harmonizer/registry/products/worldcover_2020.yaml`,
+  `harmonizer/registry/products/hrlc30_africa.yaml`, `harmonizer/affinity.py`,
+  `harmonizer/decision.py`, `harmonizer/pipeline.py`, `harmonizer/config.py`.
+- New: `harmonizer/semantics.py`, `scripts/verify_stage8a.py`, `scripts/verify_stage8b.py`,
+  `scripts/verify_stage8c.py`, `scripts/semantic_sweep.py`, `scripts/disagreement_report.py`.
+
+### Out of scope
+
+Encodings for GLC_FCS30D, LCM-10, Dynamic World, HRLC Siberia; any UI control for α;
+neural text embeddings; changes to sampling, GMM fitting, or the orphan floor.
 
 ---
 

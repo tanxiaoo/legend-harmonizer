@@ -45,6 +45,10 @@ class LegendEntry:
     name: str
     color: str  # 6-digit hex, no leading '#'
     description: str | None = None  # human-readable class definition (registry)
+    # Whether the class was found in this dataset's pixels at index time.
+    # None = not determined (GEE products, hand-written entries); only False
+    # asserts absence, which the UI renders as a greyed, non-toggleable chip.
+    observed: bool | None = None
 
 
 def _label_band(product_id: str) -> str:

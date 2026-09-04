@@ -36,7 +36,10 @@ See docs/PIPELINE.md, Stage 2.
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -45,13 +48,15 @@ import numpy as np
 
 from harmonizer.buffering import sampling_mask
 from harmonizer.config import CONFIG
-from harmonizer.overlap import Overlap, default_overlap, overlap_for_products
+from harmonizer.overlap import Overlap, overlap_for_products
 from harmonizer.registry.products import (
     Coord,
     EmbeddingAdapter,
     LabelAdapter,
     default_registry,
 )
+
+_LOG = logging.getLogger(__name__)
 
 # Property name GEE stratified sampling tags each candidate with -- unused
 # downstream but present in returned features.
@@ -219,6 +224,53 @@ def present_classes(label_image, region) -> list[int]:
     return values
 
 
+def drawable_classes(product_id: str, present: Sequence[int]) -> list[int]:
+    """Keep only the observed values the product's legend names as classes.
+
+    Class discovery reads the **pixels**, which is right for finding what is
+    actually in the region but cannot tell a land-cover class from a fill value:
+    both occupy pixels. Published legends routinely declare both -- Copernicus
+    LCM-10 lists ``254 Unclassifiable`` ("no Sentinel-1/2 observations or
+    observations of insufficient quality") and ``255 No Data`` ("pixels not
+    processed"), and several products here declare ``0 No data``.
+
+    Sampling one of those would erode it, draw points from it, spend a network
+    round trip fetching 64-dim embeddings for it, fit a GMM to "places the
+    producer could not classify", and then emit crosswalk rows matching that
+    non-class against real land cover in the other map. The output would look
+    exactly as confident as a real row and mean nothing.
+
+    The registry legend is the authority: the indexer already dropped the rows
+    the legend marks ``IsClass = FALSE`` when the dataset was indexed, so a
+    code the legend does not
+    list is either a fill value or an unmapped code that cannot be drawn or named
+    -- not something to model either way. Products with no legend (or an empty
+    one) keep the previous behaviour minus 0, so this can never make a run
+    sample *nothing*.
+    """
+    observed = [int(v) for v in present if int(v) != 0]
+    try:
+        from harmonizer.registry.legends import legend_classes
+
+        classes = legend_classes(product_id)
+    except Exception:
+        classes = None
+    if not classes:
+        return observed
+
+    allowed = {int(c.code) for c in classes}
+    kept = [v for v in observed if v in allowed]
+    dropped = [v for v in observed if v not in allowed]
+    if dropped:
+        _LOG.info(
+            "%s: ignoring observed value(s) %s -- not land-cover classes in this "
+            "product's legend (fill/no-data or unmapped codes)",
+            product_id,
+            dropped,
+        )
+    return kept
+
+
 def _grid_cell_image(region, bbox: tuple[float, float, float, float] | None = None):
     """Integer grid-cell id per pixel, so sampling can be stratified by cell.
 
@@ -269,7 +321,10 @@ def _stratified_candidates(
 
     region = overlap.ee_geometry()
     mask = sampling_mask(label_image, class_value, erode_pixels=erode_pixels)
-    cells = _grid_cell_image(region).updateMask(mask)
+    # Pass the bbox the Overlap already holds client-side, so _grid_cell_image
+    # does not spend a getInfo round trip recovering it from the geometry
+    # (explorer.py:494 already does this).
+    cells = _grid_cell_image(region, bbox=overlap.bbox).updateMask(mask)
 
     # Per-cell quota: spread the target across the number of cells, with a small
     # floor so sparse classes still draw a few per occupied cell.
@@ -420,6 +475,7 @@ def sample_class(
     *,
     count_candidates_both,
     draw_candidates,
+    candidates_are_final: bool = False,
 ) -> ClassSample:
     """Sample one class end-to-end, applying the absent-vs-buffered-away rule.
 
@@ -430,6 +486,12 @@ def sample_class(
     absent-vs-buffered-away rule is written once and applies identically to
     both (docs/PIPELINE.md, Stage 2's rule is a single method, not one per
     access type).
+
+    ``candidates_are_final`` says the caller has already applied min-spacing
+    thinning and truncation to the target. The chunked local path sets it because
+    it truncates **round-robin across grid cells**, which only it has the
+    per-cell grouping to do; re-applying ``cands[:target]`` here would take
+    points in arrival order again and undo exactly that spatial fairness.
     """
     cfg = CONFIG
     floor = cfg.sampling.points_floor
@@ -444,8 +506,9 @@ def sample_class(
 
     def _draw(erode_pixels: int) -> tuple[list[Coord], list[list[float]], list[int]]:
         cands = draw_candidates(erode_pixels)
-        cands = _thin_by_spacing(cands, cfg.sampling.min_spacing_m)
-        cands = cands[:target]
+        if not candidates_are_final:
+            cands = _thin_by_spacing(cands, cfg.sampling.min_spacing_m)
+            cands = cands[:target]
         return _fetch_survivors(cands, label_adapter, embedding_adapter, class_value)
 
     # First pass at the configured buffer.
@@ -493,7 +556,7 @@ def _sample_map_gee(
     # the global asset on each call.
     region = overlap.ee_geometry()
     label_image = _label_image_for(product_id).clip(region)
-    classes = present_classes(label_image, region)
+    classes = drawable_classes(product_id, present_classes(label_image, region))
 
     ms = MapSample(
         product_id=product_id,
@@ -526,18 +589,98 @@ def _sample_map_local(
     overlap: Overlap,
     label_adapter: LabelAdapter,
     embedding_adapter: EmbeddingAdapter,
+    progress=None,
 ) -> MapSample:
-    """The local-raster path (docs/PIPELINE.md Stage 2's deferred local path):
-    the AOI window is read into memory once and erosion/stratified sampling run
-    in-process against it (harmonizer.local_sampling), mirroring the GEE path's
-    logic exactly. Only coordinates and the AlphaEarth embedding still cross the
-    network -- the raster itself never leaves this process.
-    """
-    from harmonizer import local_sampling
+    """The local-raster path, streamed cell by cell (DESIGN.md section 3.2).
 
-    band = int(spec.band) if spec.band is not None else 1
-    window = local_sampling.read_label_window(spec.access.path, band, overlap.bbox)
-    classes = local_sampling.present_classes(window)
+    The overlap is walked one ``grid_cell_deg`` cell at a time with a single
+    decimated read per cell (``harmonizer.chunked_sampling``), so memory is
+    bounded by one cell and an AOI up to and including the **entire overlap** is
+    tractable. The previous implementation read the whole AOI window into RAM at
+    native resolution, which is why a full local x local overlap was impossible
+    rather than merely slow.
+
+    The sampling *semantics* are unchanged and still come from ``CONFIG``:
+    erosion, the homogeneity window, per-cell stratification, min-spacing
+    thinning, the floor/target, and the absent-vs-buffered-away rule (applied by
+    the shared :func:`sample_class`, exactly as on the GEE path). Only
+    coordinates and the AlphaEarth embedding cross the network; the raster never
+    leaves this process.
+
+    One whole-region scan serves every class: ``scan()`` accumulates per-class
+    pre/post-erode totals and per-cell candidates in a single pass, so the
+    per-class closures below are cheap lookups rather than fresh reads. The
+    relaxed-buffer second pass re-scans only the starved classes.
+    """
+    from harmonizer import chunked_sampling as chunked
+
+    # Progress is split between the two phases this function has, because they
+    # have very different costs and only the first one used to report at all:
+    # the raster scan (bounded, local, thousands of cells) and the per-class
+    # embedding fetch (a blocking Earth Engine round trip per class). With the
+    # scan owning the whole bar, it filled to ~50% and then sat motionless
+    # through every network call, which is indistinguishable from a hang.
+    _SCAN_SHARE = 0.5
+
+    # The first scan owns 0 -> _SCAN_SHARE. Relaxed-buffer rescans reuse the same
+    # sampler, so this is switched off before them: a rescan restarting the cell
+    # counter would drive the bar back to a few percent again and again, which
+    # reads as a run that is going backwards rather than one making progress
+    # through its classes.
+    reporting_scan = [True]
+
+    def _scan_progress(frac: float, stage: str) -> None:
+        if progress is not None and reporting_scan[0]:
+            progress(frac * _SCAN_SHARE, stage)
+
+    sampler = chunked.ChunkedSampler(
+        product_id,
+        overlap,
+        sample_scale_m=CONFIG.sampling.sample_scale_m,
+        progress=_scan_progress if progress is not None else None,
+    )
+    totals, candidates = sampler.scan()
+    reporting_scan[0] = False
+    classes = sorted(totals)
+
+    # Cache of relaxed-buffer rescans, so a class that needs one pays for it once.
+    relaxed: dict[int, tuple[dict, dict]] = {}
+    # Set by the per-class loop below so a rescan can name the class it is for.
+    current = {"frac": _SCAN_SHARE, "class": None}
+
+    def _rescan(cv: int, erode_pixels: int):
+        """Relaxed-buffer rescan for one starved class, announced before it runs.
+
+        This walks every cell again -- roughly the cost of the entire first scan
+        -- so a run with several starved classes spends most of its time here.
+        Without a message the bar simply stops on whatever class it had reached.
+        """
+        if cv not in relaxed:
+            if progress is not None:
+                progress(
+                    current["frac"],
+                    f"class {cv}: too few points after eroding -- "
+                    f"rescanning with a relaxed buffer",
+                )
+            relaxed[cv] = sampler.scan(class_values=[cv], erode_pixels=erode_pixels)
+        return relaxed[cv]
+
+    def _totals_for(cv: int, erode_pixels: int):
+        if erode_pixels == CONFIG.buffering.erode_pixels:
+            t = totals.get(cv)
+            return (t.pre_erode, t.post_erode) if t else (0, 0)
+        t = _rescan(cv, erode_pixels)[0].get(cv)
+        return (t.pre_erode, t.post_erode) if t else (0, 0)
+
+    def _draw_for(cv: int, erode_pixels: int):
+        if erode_pixels == CONFIG.buffering.erode_pixels:
+            per_cell = candidates.get(cv, [])
+        else:
+            per_cell = _rescan(cv, erode_pixels)[1].get(cv, [])
+        # Thinning and round-robin truncation happen here rather than in
+        # sample_class's generic _draw, because only this path knows the
+        # per-cell grouping that makes the truncation spatially fair.
+        return chunked.draw_for_class(per_cell)
 
     ms = MapSample(
         product_id=product_id,
@@ -545,22 +688,32 @@ def _sample_map_local(
         floor=CONFIG.sampling.points_floor,
         target=CONFIG.sampling.points_target,
     )
-    for cv in classes:
+    for i, cv in enumerate(classes):
+        current["frac"] = _SCAN_SHARE + (1.0 - _SCAN_SHARE) * (
+            i / max(1, len(classes))
+        )
+        current["class"] = cv
+        if progress is not None:
+            # Reported BEFORE the class is sampled, so the message names the
+            # class currently being fetched rather than the one just finished --
+            # this is the line a user stares at during a slow round trip.
+            progress(
+                _SCAN_SHARE + (1.0 - _SCAN_SHARE) * (i / max(1, len(classes))),
+                f"sampling class {cv} ({i + 1}/{len(classes)})",
+            )
         ms.classes[cv] = sample_class(
             cv,
             label_adapter,
             embedding_adapter,
-            count_candidates_both=lambda erode_pixels, cv=cv: local_sampling.count_candidates_both(
-                window, cv, erode_pixels=erode_pixels
+            count_candidates_both=lambda erode_pixels, cv=cv: _totals_for(
+                cv, erode_pixels
             ),
-            draw_candidates=lambda erode_pixels, cv=cv: local_sampling.stratified_candidates(
-                window,
-                cv,
-                overlap,
-                erode_pixels=erode_pixels,
-                target=CONFIG.sampling.points_target,
-            ),
+            draw_candidates=lambda erode_pixels, cv=cv: _draw_for(cv, erode_pixels),
+            # _draw_for already thinned and truncated round-robin across cells.
+            candidates_are_final=True,
         )
+    if progress is not None:
+        progress(1.0, f"sampled {len(classes)} classes")
     return ms
 
 
@@ -570,6 +723,7 @@ def sample_map(
     aoi: tuple[float, float, float, float] | None = None,
     label_adapter: LabelAdapter | None = None,
     embedding_adapter: EmbeddingAdapter | None = None,
+    progress=None,
 ) -> MapSample:
     """Sample every class present in the overlap for one label product.
 
@@ -585,6 +739,11 @@ def sample_map(
     local-raster product's runs in-process against the file on disk
     (``_sample_map_local``). Either way the embedding still comes from
     AlphaEarth over GEE -- only the *label* source differs.
+
+    ``progress(fraction, stage)`` is reported per grid cell on the local path,
+    where a full-overlap scan is thousands of cells and the caller needs to see
+    it advance. The GEE path does not report it: its work happens inside a few
+    blocking server-side calls with no intermediate state to observe.
     """
     overlap = overlap or overlap_for_products([product_id, "alphaearth"], aoi=aoi)
 
@@ -594,7 +753,10 @@ def sample_map(
 
     spec = reg.spec(product_id)
     if spec.access.method == "local_raster":
-        return _sample_map_local(product_id, spec, overlap, label_adapter, embedding_adapter)
+        return _sample_map_local(
+            product_id, spec, overlap, label_adapter, embedding_adapter,
+            progress=progress,
+        )
     return _sample_map_gee(product_id, overlap, label_adapter, embedding_adapter)
 
 
@@ -644,15 +806,47 @@ def save_map_sample(ms: MapSample) -> Path:
         }
 
     path = cache_path(ms.product_id)
-    np.savez_compressed(
-        path,
-        coords=np.asarray(all_coords, dtype=float).reshape(-1, 2),
-        embeddings=np.asarray(all_emb, dtype=float).reshape(
-            -1, CONFIG.maps.embedding_dims
-        ),
-        labels=np.asarray(all_labels, dtype=int),
-        class_values=np.asarray(all_class_values, dtype=int),
-    )
+    # Write to a process-unique temporary file and rename into place.
+    #
+    # ``np.savez_compressed`` writes straight to the destination, so two writers
+    # aiming at the same path interleave into one file: a real corruption seen
+    # here was a .npz whose four arrays were all intact but whose end-of-central
+    # -directory record pointed 122 bytes past the actual central directory,
+    # which reads back as ``BadZipFile: Bad magic number for central directory``.
+    # That happens whenever a second server (or a re-run started before the
+    # first finished) samples the same product concurrently -- easy to do, since
+    # a stale process holding the port is invisible until something like this
+    # breaks. A rename is atomic on Windows and POSIX alike, so a reader either
+    # sees the previous complete file or the new complete file, never a blend.
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp.npz")
+    try:
+        np.savez_compressed(
+            tmp,
+            coords=np.asarray(all_coords, dtype=float).reshape(-1, 2),
+            embeddings=np.asarray(all_emb, dtype=float).reshape(
+                -1, CONFIG.maps.embedding_dims
+            ),
+            labels=np.asarray(all_labels, dtype=int),
+            class_values=np.asarray(all_class_values, dtype=int),
+        )
+        # Verify before publishing: a cache file that cannot be read back is
+        # worse than no cache file, because it fails a later stage instead of
+        # this one, far from the cause.
+        with np.load(tmp) as check:
+            _ = check["class_values"]
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    # Sidecar last, and atomically too: it is the human-readable half of the
+    # same record, and a sidecar describing a .npz that failed to publish would
+    # misreport what is cached.
     sidecar = path.with_suffix(".json")
-    sidecar.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    tmp_json = sidecar.with_name(f"{sidecar.stem}.{os.getpid()}.tmp.json")
+    tmp_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    os.replace(tmp_json, sidecar)
     return path

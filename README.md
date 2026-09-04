@@ -146,7 +146,7 @@ Earth Engine under your own account.
 ## Setup
 
 1. `pip install -e .`
-2. Place the HRLC GeoTIFF in `data/` (not needed for the WorldCover test-swap).
+2. Add your land-cover maps — see [Adding a dataset](#adding-a-dataset) below.
 3. `earthengine authenticate` — GEE runs under your own account; this is the only
    credential step, and there is no login.
 4. `python run.py` — starts the local server and opens the one-page app in your
@@ -154,6 +154,75 @@ Earth Engine under your own account.
 
 Everything runs on your machine under your own GEE quota; there is no shared
 infrastructure.
+
+## Adding a dataset
+
+**One folder per map: the rasters, plus a `legend.csv` beside them.**
+
+```
+data/
+├── WorldCover_2020/
+│   ├── *.tif
+│   └── legend.csv
+│
+├── JAXA_HRLULC_SEA_2023/
+│   ├── *.tif
+│   └── legend.csv
+```
+
+That is the whole rule — one folder, its rasters, and a `legend.csv` beside
+them. Drop it in, start the app (or press **↻ datasets**), and the map is
+indexed, converted for fast display, and added to the picker — no CLI step. The
+folder name is yours to choose and becomes the map's name; only the legend has a
+fixed name, so nothing has to be matched or guessed.
+
+**You download the data; the app never fetches, moves or modifies it.**
+
+The legend CSV needs these columns:
+
+```csv
+Class Code,Color code,Label,IsClass,Description
+10,#006400,Tree cover,TRUE,Areas dominated by trees...
+20,#ffbb22,Shrubland,TRUE,Areas dominated by shrubs...
+255,#000000,No Data,FALSE,Pixels not processed.
+```
+
+**`IsClass` is yours to set, per row.** Mark `FALSE` for anything that is a
+fill/no-data value rather than land cover — *No Data*, *Unclassifiable*,
+*Cloud*, whatever your producer calls it. Those rows are dropped from the map
+legend and **never sampled**, so they cannot reach the matching table. Marking a
+fill value `TRUE` would have the pipeline fit a distribution to "pixels nobody
+could classify" and match it against real land cover in the other map.
+
+The column is optional: leave a cell blank, or omit the column entirely, and
+every row counts as a class (`TRUE`, `yes`, `1` and `FALSE`, `no`, `0` are all
+accepted). Classes the legend declares but the data does not contain appear as
+greyed, non-clickable chips.
+
+`data/datasets.yaml` is optional. Add an entry only to set what cannot be read
+from the files — a display name, provider, year, or the band to show for a
+multi-band annual series.
+
+### Removing a dataset
+
+Delete its folder from `data/`, then press **↻ datasets**. The app notices the
+folder is gone, marks the product **`data folder deleted`** (listed but not
+selectable), and offers to remove what registration produced from it — the
+converted COG tree, the VRT, the registry entry, and the tile/sample caches.
+Those can be several GB, so it asks first and names the size; nothing is deleted
+without a confirmation, and **`data/` is never touched.**
+
+Choose *Cancel* to keep them: put the folder back and press ↻ datasets, and the
+dataset works again with no re-conversion.
+
+**Check your download first.** A truncated GeoTIFF opens fine and reports correct
+metadata — the damage only surfaces later, and a partially-readable file can
+render a plausible but *wrong* map. This takes seconds:
+
+```bash
+python scripts/check_downloads.py          # every dataset under data/
+python scripts/check_downloads.py --delete # remove truncated files to re-fetch
+```
 
 ## Parameters and defaults
 

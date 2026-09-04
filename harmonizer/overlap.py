@@ -100,17 +100,24 @@ def overlap_for_products(
 ) -> Overlap:
     """The working region for a named set of products, from their footprints.
 
-    Looks each product up in the default registry and intersects its footprint;
-    global products (WorldCover, Dynamic World, AlphaEarth) do not constrain the
-    region, so a global pair yields a global region while any pairing including
-    HRLC is clamped to HRLC's Eastern Sahel box. An optional ``aoi`` box narrows
-    that footprint-derived region further without changing the derivation logic.
-    """
-    from harmonizer.registry.products import default_registry
+    Each product contributes its **operational** footprint
+    (``harmonizer.footprints``): for a local raster that is the rasterio bounds
+    of the actual source reprojected to EPSG:4326, per docs/PIPELINE.md section 2
+    and DESIGN.md 3.1; for a GEE product, or where the source cannot be read, the
+    registry's declared box. Global products (WorldCover, Dynamic World,
+    AlphaEarth) contribute ``None`` and so do not constrain the region, meaning a
+    global pair yields a global region while any pairing including a bounded
+    product is clamped to that product's real extent.
 
-    reg = default_registry()
+    Deriving from the source matters because a declared box can be stale or
+    approximate -- it is hand-written in the YAML and describes whatever tile was
+    present when it was written. An optional ``aoi`` box narrows the
+    footprint-derived region further without changing the derivation logic.
+    """
+    from harmonizer.footprints import operational_footprint
+
     return overlap_of_footprints(
-        (reg.get(pid).footprint for pid in product_ids), aoi=aoi
+        (operational_footprint(pid) for pid in product_ids), aoi=aoi
     )
 
 

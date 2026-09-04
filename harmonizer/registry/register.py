@@ -173,6 +173,45 @@ class Detected:
 #: check rather than silently disappearing.
 _FULL_READ_PIXEL_LIMIT = 50_000_000
 
+#: Native-resolution windows sampled across a large mosaic to discover its class
+#: codes, and the side of each window in pixels. 24x24 windows of 512px covers
+#: ~150M pixels spread over the whole raster -- enough to find every class that
+#: is not vanishingly rare, at a cost comparable to the decimated read it
+#: replaced, and without ever touching the (averaged, code-fabricating) overview
+#: pyramid.
+_CODE_SAMPLE_GRID = 24
+_CODE_SAMPLE_WINDOW = 512
+
+
+def _sampled_codes(ds, band: int):
+    """Distinct values across a grid of native-resolution windows.
+
+    Reading at native resolution is the whole point: no resampling of any kind
+    happens, so every value returned is one that some pixel genuinely holds. A
+    window that fails to read (a truncated download) is skipped rather than
+    aborting discovery -- a partly-damaged file should still register with the
+    classes it can prove, and the corruption is reported separately.
+    """
+    import numpy as np
+    import rasterio
+
+    seen: set[int] = set()
+    step_y = max(1, ds.height // _CODE_SAMPLE_GRID)
+    step_x = max(1, ds.width // _CODE_SAMPLE_GRID)
+    for top in range(0, ds.height, step_y):
+        for left in range(0, ds.width, step_x):
+            window = rasterio.windows.Window(
+                left,
+                top,
+                min(_CODE_SAMPLE_WINDOW, ds.width - left),
+                min(_CODE_SAMPLE_WINDOW, ds.height - top),
+            )
+            try:
+                seen.update(np.unique(ds.read(band, window=window)).tolist())
+            except Exception:
+                continue
+    return np.array(sorted(seen))
+
 
 def detect_local_raster(path: str | Path, band: int = 1) -> Detected:
     """Auto-detect CRS, footprint, resolution, codes, and any embedded colour
@@ -198,16 +237,26 @@ def detect_local_raster(path: str | Path, band: int = 1) -> Detected:
             det.footprint = (min(xs), min(ys), max(xs), max(ys))
         except Exception:  # pragma: no cover - defensive
             det.footprint = None
-        # Class codes actually present. Full read for a normal-sized source;
-        # decimated for a continent-scale mosaic (see _FULL_READ_PIXEL_LIMIT).
+        # Class codes actually present. Full read for a normal-sized source; for
+        # a continent-scale mosaic, a grid of NATIVE-RESOLUTION windows.
+        #
+        # Deliberately **not** a decimated whole-raster read. ``out_shape`` lets
+        # GDAL satisfy the request from the overview pyramid, and these products'
+        # published pyramids are AVERAGE-resampled: averaging land-cover codes
+        # invents values that exist nowhere in the legend. Passing
+        # ``Resampling.nearest`` does not save it -- that governs the residual
+        # step, not which pyramid level GDAL reads from.
+        #
+        # The symptom was severe and silent: CCI HRLC (codes 10..150) reported
+        # class codes 1..18, which matched a *different* product's legend closely
+        # enough that the generated YAML looked plausible while naming every
+        # class wrongly. Native windows cannot fabricate a code, because every
+        # value read is a value some pixel actually holds.
         total_pixels = ds.width * ds.height
         if total_pixels > _FULL_READ_PIXEL_LIMIT:
-            decimation = (total_pixels / _FULL_READ_PIXEL_LIMIT) ** 0.5
-            out_shape = (1, max(1, int(ds.height / decimation)), max(1, int(ds.width / decimation)))
-            data = ds.read(band, out_shape=out_shape, resampling=rasterio.enums.Resampling.nearest)
+            vals = _sampled_codes(ds, band)
         else:
-            data = ds.read(band)
-        vals = np.unique(data)
+            vals = np.unique(ds.read(band))
         if ds.nodata is not None:
             vals = vals[vals != ds.nodata]
         det.class_codes = sorted(int(v) for v in vals)
