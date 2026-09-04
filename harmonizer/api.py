@@ -1895,6 +1895,16 @@ def review_explore(req: ExploreRequest) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        # Anything else -- most often an Earth Engine credentials/permission
+        # problem -- used to surface as a bare "Internal Server Error" with the
+        # real cause only in the server log, which is close to undiagnosable
+        # from the page. Report what actually went wrong instead.
+        _LOG.exception("evidence explore failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"{type(exc).__name__}: {exc}",
+        ) from exc
 
     return {
         "mode": result.mode,

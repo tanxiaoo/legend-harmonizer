@@ -76,6 +76,138 @@ _CELL_PROP = "cell"
 
 
 # --------------------------------------------------------------------------- #
+# Local-raster support
+# --------------------------------------------------------------------------- #
+# The explorer was written against the GEE label products, but Stage 2 has read
+# local rasters since the Africa product set landed (``harmonizer.local_sampling``,
+# dispatched from ``sampling.sample_map``). Only the *explorer* still assumed GEE,
+# so Review failed with "Stage 2 sampling supports the GEE label products only"
+# on exactly the pairs the rest of the pipeline handles fine. These helpers give
+# it the same local path, so evidence works for any label product the registry
+# can read.
+
+
+def _is_local(product_id: str) -> bool:
+    """True when this product is read from a local raster rather than GEE."""
+    spec = _product_spec(product_id)
+    return spec is not None and spec.access.method == "local_raster"
+
+
+def _local_labels_at(product_id: str, coords) -> list[int | None]:
+    """Read one local raster's label at each (lon, lat), in order.
+
+    The GEE counterpart is ``_gee.sample_image``; this is the local twin, used
+    both to read back the "other" map's label at cached points and to label a
+    live draw. Coordinates are transformed into the raster's CRS explicitly --
+    getting that wrong silently returns a neighbouring pixel's class
+    (docs/PIPELINE.md, Stage 1).
+    """
+    import rasterio
+    from pyproj import Transformer
+
+    spec = _product_spec(product_id)
+    if spec is None or not spec.access.path:
+        raise ValueError(f"no local raster path registered for {product_id!r}")
+
+    path = _resolve_raster_path(spec.access.path)
+    band = int(spec.band) if spec.band is not None else 1
+    pts = [(float(lon), float(lat)) for lon, lat in coords]
+    if not pts:
+        return []
+
+    with rasterio.open(path) as ds:
+        if str(ds.crs) not in ("EPSG:4326", "epsg:4326"):
+            tf = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            xs, ys = tf.transform([p[0] for p in pts], [p[1] for p in pts])
+            sample_pts = list(zip(xs, ys))
+        else:
+            sample_pts = pts
+        nodata = ds.nodata
+        out: list[int | None] = []
+        for vals in ds.sample(sample_pts, indexes=[band]):
+            v = vals[0]
+            # Outside the raster, rasterio yields the nodata (or 0) fill; a
+            # no-label point must read as None, not as class 0.
+            out.append(None if nodata is not None and v == nodata else int(v))
+    return out
+
+
+def _resolve_raster_path(path: str) -> str:
+    """A registry ``access.path`` as an absolute path (they are repo-relative)."""
+    from pathlib import Path
+
+    from harmonizer.config import REPO_ROOT
+
+    p = Path(path)
+    return str(p if p.is_absolute() else (REPO_ROOT / p))
+
+
+def _labels_at(product_id: str, coords, overlap: Overlap) -> list[int | None]:
+    """One map's label at each coordinate, whichever source it comes from.
+
+    The dispatcher the mixed case needs: a local x GEE pair reads one side with
+    rasterio and the other from Earth Engine, and the caller should not care
+    which is which.
+    """
+    if not coords:
+        return []
+    if _is_local(product_id):
+        return _local_labels_at(product_id, coords)
+
+    # Imported here, not at module scope, so a local-only run never needs the
+    # GEE adapter (and its credentials) to be importable at all.
+    from harmonizer.registry.adapters import _gee
+
+    region = overlap.ee_geometry()
+    region_key = tuple(round(float(x), 4) for x in overlap.bbox)
+    img = _label_image_for(product_id, region, region_key).clip(region)
+    rows = _gee.sample_image(img, coords, scale=_native_scale_m(product_id))
+    return [
+        None if props is None or props.get("label") is None else int(props["label"])
+        for props in rows
+    ]
+
+
+def _local_candidates(
+    product_id: str, class_value: int, overlap: Overlap, n: int
+) -> list[Coord]:
+    """Declustered candidate coordinates for one class of a local raster.
+
+    Mirrors the GEE live draw: build the class's sampling mask (eroded, with the
+    homogeneous-neighbourhood test), draw from it, then thin by the Stage 2
+    spacing so evidence points are spread exactly as sample points are.
+    """
+    import numpy as np
+
+    from harmonizer import local_sampling as _local
+
+    spec = _product_spec(product_id)
+    band = int(spec.band) if spec.band is not None else 1
+    window = _local.read_label_window(
+        _resolve_raster_path(spec.access.path), band, tuple(overlap.bbox)
+    )
+    mask = _local.sampling_mask(
+        window, int(class_value), CONFIG.buffering.erode_pixels
+    )
+    rows, cols = np.nonzero(mask)
+    if rows.size == 0:
+        return []
+
+    # Draw a bounded random subset before converting, so a class covering
+    # millions of pixels does not build a huge coordinate array to throw away.
+    rng = np.random.default_rng(CONFIG.gmm.random_seed)
+    take = min(rows.size, max(int(n) * 200, 2000))
+    if rows.size > take:
+        pick = rng.choice(rows.size, size=take, replace=False)
+        rows, cols = rows[pick], cols[pick]
+
+    lons, lats = window.pixel_to_lonlat(rows, cols)
+    coords = list(zip(lons.tolist(), lats.tolist()))
+    rng.shuffle(coords)
+    return _thin_by_spacing(coords, CONFIG.sampling.min_spacing_m)[: int(n)]
+
+
+# --------------------------------------------------------------------------- #
 # Result types
 # --------------------------------------------------------------------------- #
 
@@ -271,23 +403,27 @@ def _cached_cross_labels(
     if key in payload["classes"]:
         return [None if v is None else int(v) for v in payload["classes"][key]]
 
-    # One GEE read-back for the whole class, bounded to the points' own bbox.
-    import ee
+    # Read the other map's label at these points: locally with rasterio when it
+    # is a local raster, otherwise one GEE read-back bounded to the points' bbox.
+    if _is_local(other_id):
+        labels = _local_labels_at(other_id, coords)
+    else:
+        import ee
 
-    lons = [c[0] for c in coords]
-    lats = [c[1] for c in coords]
-    pad = 0.01
-    bbox = (min(lons) - pad, min(lats) - pad, max(lons) + pad, max(lats) + pad)
-    region = ee.Geometry.Rectangle(
-        list(bbox), proj=CONFIG.maps.target_crs, geodesic=False
-    )
-    region_key = tuple(round(float(x), 4) for x in bbox)
-    other_img = _label_image_for(other_id, region, region_key).clip(region)
-    rows = _gee.sample_image(other_img, coords, scale=_native_scale_m(other_id))
-    labels = [
-        None if props is None or props.get("label") is None else int(props["label"])
-        for props in rows
-    ]
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+        pad = 0.01
+        bbox = (min(lons) - pad, min(lats) - pad, max(lons) + pad, max(lats) + pad)
+        region = ee.Geometry.Rectangle(
+            list(bbox), proj=CONFIG.maps.target_crs, geodesic=False
+        )
+        region_key = tuple(round(float(x), 4) for x in bbox)
+        other_img = _label_image_for(other_id, region, region_key).clip(region)
+        rows = _gee.sample_image(other_img, coords, scale=_native_scale_m(other_id))
+        labels = [
+            None if props is None or props.get("label") is None else int(props["label"])
+            for props in rows
+        ]
 
     payload["classes"][key] = labels
     CONFIG.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -613,7 +749,11 @@ def explore_evidence(
     if mode not in ("both", "reference", "compare"):  # pragma: no cover
         raise ValueError(f"unknown mode: {mode!r}")
 
-    ensure_initialized()
+    # Only initialise Earth Engine if a side actually needs it. A local x local
+    # pair must work with no GEE credentials at all -- requiring them there
+    # turned an offline-capable query into an authentication error.
+    if not (_is_local(reference_id) and _is_local(compare_id)):
+        ensure_initialized()
 
     # Cache-backed path first (the default): reuse the Stage 2 sample points --
     # the exact points that trained the drawn-from class's GMM -- and read back
@@ -632,53 +772,90 @@ def explore_evidence(
 
     if kept is None:
         source = "live"
-        region = overlap.ee_geometry()
+        # The draw side is whichever map the mode queries; "both" needs a joint
+        # mask, which only the GEE path can express server-side.
+        n_draw = int(math.ceil(oversample * n))
 
-        # Build each annual label image **once** and reuse it for both the mask
-        # draw and the label read-back, so the expensive composite (Dynamic
-        # World's year-long per-pixel mode) is not recomputed per read. Both
-        # sides are built because both labels are read back at every location.
-        # Bound each composite to the working region and cache it by the region's
-        # bbox, so the expensive Dynamic World modal composite is filtered to the
-        # AOI and reused across queries in the same area.
-        region_key = tuple(round(float(x), 4) for x in overlap.bbox)
-        ref_img = _label_image_for(reference_id, region, region_key).clip(region)
-        cmp_img = _label_image_for(compare_id, region, region_key).clip(region)
+        if _is_local(reference_id) or _is_local(compare_id):
+            # Local-raster path: draw the candidates in-process from the raster,
+            # then label both sides. Each side is read with whichever mechanism
+            # it needs, so a local x GEE pair works as well as local x local.
+            if mode == "both":
+                # A joint draw needs both masks in one place; do it on the local
+                # side and let the exactness filter below enforce the other.
+                draw_id, draw_value = (
+                    (reference_id, reference_value)
+                    if _is_local(reference_id)
+                    else (compare_id, compare_value)
+                )
+            elif mode == "reference":
+                draw_id, draw_value = reference_id, reference_value
+            else:
+                draw_id, draw_value = compare_id, compare_value
 
-        # Build the mask to draw from, per mode.
-        if mode == "both":
-            mask = _joint_mask(ref_img, cmp_img, reference_value, compare_value)
-        elif mode == "reference":
-            # Representative samples of the reference class = a single-class
-            # Stage 2 draw.
-            mask = sampling_mask(ref_img, int(reference_value))
-        else:  # "compare"
-            mask = sampling_mask(cmp_img, int(compare_value))
+            if _is_local(draw_id):
+                coords = _local_candidates(draw_id, int(draw_value), overlap, n_draw)
+            else:
+                region = overlap.ee_geometry()
+                region_key = tuple(round(float(x), 4) for x in overlap.bbox)
+                img = _label_image_for(draw_id, region, region_key).clip(region)
+                coords = _draw_declustered(
+                    sampling_mask(img, int(draw_value)),
+                    overlap,
+                    max(scale_m, float(CONFIG.review.draw_scale_m)),
+                    n_draw,
+                )
 
-        # Oversample the draw so that, after the exactness filter below, we still
-        # have about ``n`` locations. Boundary points can be dropped by the
-        # filter, so ask for a margin rather than exactly n.
-        #
-        # Find candidates at a COARSE scale so the stratifiedSample is fast --
-        # the explorer only needs to locate representative places, and each
-        # location's label is read back below at native resolution regardless.
-        # Never finer than the join scale (don't pretend to more detail than the
-        # data has).
-        draw_scale_m = max(scale_m, float(CONFIG.review.draw_scale_m))
-        coords = _draw_declustered(
-            mask, overlap, draw_scale_m, int(math.ceil(oversample * n))
-        )
+            ref_labels = _labels_at(reference_id, coords, overlap)
+            cmp_labels = _labels_at(compare_id, coords, overlap)
+        else:
+            region = overlap.ee_geometry()
 
-        # Read both sides' labels back from the already-built images in a SINGLE
-        # round trip (points only cross the network). Read at the finer of the
-        # two products' **native** resolutions, not the (possibly coarse) draw
-        # scale, so a location's reported label is what the map says there.
-        read_scale_m = min(
-            _native_scale_m(reference_id), _native_scale_m(compare_id)
-        )
-        ref_labels, cmp_labels = _read_labels_both(
-            ref_img, cmp_img, coords, read_scale_m
-        )
+            # Build each annual label image **once** and reuse it for both the
+            # mask draw and the label read-back, so the expensive composite
+            # (Dynamic World's year-long per-pixel mode) is not recomputed per
+            # read. Both sides are built because both labels are read back at
+            # every location. Bound each composite to the working region and
+            # cache it by the region's bbox, so the expensive Dynamic World modal
+            # composite is filtered to the AOI and reused across queries in the
+            # same area.
+            region_key = tuple(round(float(x), 4) for x in overlap.bbox)
+            ref_img = _label_image_for(reference_id, region, region_key).clip(region)
+            cmp_img = _label_image_for(compare_id, region, region_key).clip(region)
+
+            # Build the mask to draw from, per mode.
+            if mode == "both":
+                mask = _joint_mask(ref_img, cmp_img, reference_value, compare_value)
+            elif mode == "reference":
+                # Representative samples of the reference class = a single-class
+                # Stage 2 draw.
+                mask = sampling_mask(ref_img, int(reference_value))
+            else:  # "compare"
+                mask = sampling_mask(cmp_img, int(compare_value))
+
+            # Oversample the draw so that, after the exactness filter below, we
+            # still have about ``n`` locations. Boundary points can be dropped by
+            # the filter, so ask for a margin rather than exactly n.
+            #
+            # Find candidates at a COARSE scale so the stratifiedSample is fast --
+            # the explorer only needs to locate representative places, and each
+            # location's label is read back below at native resolution regardless.
+            # Never finer than the join scale (don't pretend to more detail than
+            # the data has).
+            draw_scale_m = max(scale_m, float(CONFIG.review.draw_scale_m))
+            coords = _draw_declustered(mask, overlap, draw_scale_m, n_draw)
+
+            # Read both sides' labels back from the already-built images in a
+            # SINGLE round trip (points only cross the network). Read at the finer
+            # of the two products' **native** resolutions, not the (possibly
+            # coarse) draw scale, so a location's reported label is what the map
+            # says there.
+            read_scale_m = min(
+                _native_scale_m(reference_id), _native_scale_m(compare_id)
+            )
+            ref_labels, cmp_labels = _read_labels_both(
+                ref_img, cmp_img, coords, read_scale_m
+            )
 
         # Exactness filter. ``stratifiedSample`` (mask draw) and
         # ``sampleRegions`` (label read-back) reproject independently, so a point
